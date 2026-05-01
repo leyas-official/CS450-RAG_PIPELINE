@@ -1,25 +1,31 @@
-fastapi==0.111.0
-uvicorn[standard]==0.22.0
-pydantic==2.7.1
-python-multipart==0.0.9
+# --- Core Web & API ---
+# Relaxed slightly to allow ChromaDB/SQLModel to resolve
+fastapi>=0.111.0
+uvicorn[standard]>=0.22.0
+pydantic>=2.8.0
+python-multipart
 python-socketio
 grpcio
 
-passlib==1.7.4
-passlib[bcrypt]
+# --- Auth ---
+# Consolidated passlib
+passlib[bcrypt]>=1.7.4
 PyJWT[crypto]
 
-requests==2.32.2
-aiohttp==3.9.5
+# --- HTTP ---
+requests
+aiohttp
 httpx
 
-# AI libraries
+# --- AI & LLM Providers ---
+# Let litellm dictate the compatible versions of these
 openai
 anthropic
 google-generativeai
 vertexai
+litellm==1.79.2
 
-# Database
+# --- Database & Observability ---
 pymongo
 peewee
 SQLAlchemy
@@ -28,40 +34,33 @@ redis
 sqlmodel
 chromadb
 psycopg2-binary
-
-# Observability
 langfuse
 ddtrace
 opik
 
-# ML libraries
+# --- ML & NLP ---
 torch
 numpy
 pandas
-
 xgboost
 scikit-learn
-
-# NLP libraries
 sentence-transformers
 transformers
 tokenizers
 nltk
 tiktoken
 
-# Image processing
+# --- Vision & Web Scraping ---
 Pillow
 opencv-python
-
-# Visualization
 matplotlib
 seaborn
-
-# Web scraping
 selenium
 playwright
 beautifulsoup4
 
-# Llama Index for RAG
-llama-index
-llama-index-llms-ollama
+# --- Llama Index ---
+# Synced to a stable baseline that satisfies Ollama
+llama-index>=0.12.4
+llama-index-core>=0.12.4
+llama-index-llms-ollama>=0.5.0
