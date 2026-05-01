@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 PORT="${PORT:-9099}"
 HOST="${HOST:-0.0.0.0}"
+TIKA_JAR="${TIKA_JAR:-tika-server-standard-3.3.0.jar}"
+TIKA_PORT="${TIKA_PORT:-9998}"
 # Default value for PIPELINES_DIR
 PIPELINES_DIR=${PIPELINES_DIR:-./pipelines}
 
@@ -103,6 +105,48 @@ install_frontmatter_requirements() {
   fi
 }
 
+run_tika() {
+    local JAR_PATH="${1:-../tika-server.jar}"
+    local PORT="${2:-9998}"
+
+    # Resolve absolute path
+    JAR_PATH="$(realpath "$JAR_PATH")"
+
+    if [ ! -f "$JAR_PATH" ]; then
+        echo "[ERROR] Tika JAR not found at: $JAR_PATH"
+        return 1
+    fi
+
+    # Check Java
+    if ! command -v java >/dev/null 2>&1; then
+        echo "[ERROR] Java is not installed or not in PATH"
+        return 1
+    fi
+
+    # Check if port is already in use
+    if lsof -i ":$PORT" >/dev/null 2>&1; then
+        echo "[INFO] Tika already running on port $PORT"
+        return 0
+    fi
+
+    echo "[INFO] Starting Tika server..."
+    echo "       JAR:  $JAR_PATH"
+    echo "       PORT: $PORT"
+
+    # Run in background, log output
+    nohup java -jar "$JAR_PATH" --port "$PORT" \
+        > tika.log 2>&1 &
+
+    sleep 2
+
+    if lsof -i ":$PORT" >/dev/null 2>&1; then
+        echo "[SUCCESS] Tika server started on http://localhost:$PORT"
+    else
+        echo "[ERROR] Failed to start Tika server. Check tika.log"
+        return 1
+    fi
+}
+
 
 # Parse command line arguments for mode
 MODE="full"   # select a runmode ("setup", "run", "full" (setup + run))
@@ -148,6 +192,9 @@ if [[ "$MODE" == "setup" || "$MODE" == "full" ]]; then
   else
     echo "PIPELINES_URLS not specified. Skipping pipelines download and installation."
   fi
+
+  echo "Starting Tika server..."
+  run_tika "$TIKA_JAR" "$TIKA_PORT"
 fi
 
 if [[ "$MODE" == "run" || "$MODE" == "full" ]]; then
