@@ -25,34 +25,36 @@ import re
 from typing import List, Dict, Optional, Any
 from llama_index.vector_stores.faiss import FaissVectorStore
 import faiss
-
-
+from llama_index.core.vector_stores import MetadataFilters, MetadataFilter
+from dataclasses import dataclass, field
+import numpy as np
 
 load_dotenv()
 
-prompt = PromptTemplate("""
-You are a helpful assistant with experience in legal and software requirements.
+prompt_template = """You are an expert system analyst specializing in legal and software requirements. 
+Your task is to extract functional requirements from the provided Arabic legal text chunk (e.g., "مادة 50").
 
-The following text is in Arabic. Identify statements that express rules such as:
-- obligations (e.g., يجب, يلتزم)
-- prohibitions (e.g., لا يجوز, يُحظر)
-- permissions or rights (e.g., يجوز, يحق)
+Identify statements that express rules:
+- Obligations (e.g., يجب, يلتزم)
+- Prohibitions (e.g., لا يجوز, يُحظر)
+- Permissions or rights (e.g., يجوز, يحق)
 
-For each relevant statement:
-- Rewrite it as a functional requirement in CLEAR ARABIC
-- Use the format: "[Actor] must [action] [conditions]" when possible
-- If the actor is not clear, you may infer a reasonable one (e.g., "The user", "The system")
-
-Keep the output concise and limit to a few key requirements.
-
-Output:
-- Do not include explanations
+EXTRACTION RULES:
+1. Translate the extracted requirement into CLEAR ARABIC.
+2. Structure each requirement logically following this Arabic pattern: 
+   "[الفاعل] يجب/يجوز أن [الفعل] [الشروط]" 
+   (Example: "النظام يجب أن يرفض الطلب إذا كان غير مكتمل")
+3. If the actor (الفاعل) is not explicitly stated, you MUST infer a reasonable system actor (e.g., "النظام" (The system), "المستخدم" (The user), "المسؤول" (The admin)).
+4. Keep the output concise. Limit to the core functional requirements.
+5. You MUST output ONLY valid JSON. Absolutely no conversational text, no greetings, and no explanations before or after the JSON.
 
 {format_instructions}
 
-Text:
+Arabic Text to Analyze:
 {context}
-""")
+"""
+#
+# prompt = PromptTemplate.from_template(prompt_template)
 
 def load_documents_with_tika(directory: str):
     documents = []
@@ -85,7 +87,6 @@ def load_documents_with_tika(directory: str):
 
     return documents
 
-# Article Number Extractor  (Arabic-aware)
 class ArabicArticleExtractor:
     """prevents double-counting and handles edge cases gracefully"""
 
@@ -99,18 +100,23 @@ class ArabicArticleExtractor:
             r"المواد\s+((?:[\d٠-٩]+\s*(?:و|،|,)\s*)+[\d٠-٩]+)",
             re.UNICODE,
         ),
-        # المادة رقم 101  /  المادة 87
+        # Handles chains like:
+        #   "المادة رقم 122 و المادة 12"
+        #   "المادة 5 والمادة 10 والمادة 22"
+        #   "المادة رقم 3 و المادة رقم 7"
+        #   "المادتين 15 و 16"
+        #   "مادة رقم 5"  (without ال)
+        #
+        # Strategy: match the FULL span (anchor + number, then any chain of
+        # "و/،  [optional: المادة/مادة]  [optional: رقم]  number").
+        # All digit sequences are then extracted from the whole match,
+        # so every chained article number is captured regardless of whether
+        # "المادة" is repeated between them.
         re.compile(
-            r"الماد(?:ة|تين|ات)\s+(?:رقم\s+)?([\d٠-٩]+(?:\s*(?:و|والمادة|والمادتين|،|,)\s*[\d٠-٩]+)*)",
+            r"(?:ال)?ماد(?:ة|تين|ات)\s+(?:رقم\s+)?[\d٠-٩]+"
+            r"(?:\s*(?:و|،|,)\s*(?:(?:ال)?ماد(?:ة|تين|ات)\s+)?(?:رقم\s+)?[\d٠-٩]+)*",
             re.UNICODE,
         ),
-        # مادة رقم 5   (without ال)
-        re.compile(
-            r"\bماد(?:ة|تين|ات)\s+(?:رقم\s+)?([\d٠-٩]+)",
-            re.UNICODE,
-        ),
-        # standalone  رقم 7  when preceded by "المادة" found elsewhere – fallback
-        re.compile(r"\برقم\s+([\d٠-٩]+)", re.UNICODE),
     ]
 
     @classmethod
@@ -126,12 +132,14 @@ class ArabicArticleExtractor:
 
         for pattern in cls._PATTERNS:
             for match in pattern.finditer(query):
-                # extract all digit sequences from the matched group
-                nums = re.findall(r"\d+", match.group(1) if match.lastindex else match.group(0))
-                found.update(int(n) for n in nums if n.isdigit())
+                # Scan the full match span for all digit sequences.
+                # Pattern 0 still has a capture group for the list portion;
+                # Pattern 1 is a whole-span match with no capture groups.
+                # Using group(0) works correctly for both cases.
+                nums = re.findall(r"\d+", match.group(0))
+                found.update(int(n) for n in nums)
 
         return sorted(found)
-
 
 # Chunk Article Parser  (run once at index-build time)
 class ChunkArticleParser:
@@ -290,14 +298,14 @@ def split_by_articles(text):
     Accept the raw text of a legal document and return a flat list where:
       - Each article (المادة N / البند N) is a single entry containing
         the header fused with all of its body content.
-      - Text outside any article is split into individual sentences,
-        each becoming its own entry.
+      - Text before the first article (metadata, preamble, whereas clauses)
+        is discarded entirely.
 
     Args:
         raw_text: The raw string content of the legal document.
 
     Returns:
-        List[str]: Ordered list of text segments.
+        List[str]: Ordered list of article segments only.
     """
     # --- Step 1: sanitise ---
     text = sanitize(raw_text)
@@ -309,17 +317,12 @@ def split_by_articles(text):
     headers = _find_headers(text)
 
     if not headers:
-        # No articles at all → return sentence-split of the whole text
-        return _split_sentences(text)
+        # No articles at all → nothing to return
+        return []
 
     segments: List[str] = []
 
-    # --- Step 4: handle text BEFORE the first article header ---
-    pre_text = text[: headers[0]["start"]].strip()
-    if pre_text:
-        segments.extend(_split_sentences(pre_text))
-
-    # --- Step 5: process each article ---
+    # --- Step 4: process each article (pre-article text is intentionally dropped) ---
     for i, hdr in enumerate(headers):
         # Content runs from end of this header's line to start of next header
         content_start = hdr["end"]
@@ -342,6 +345,47 @@ def split_by_articles(text):
 
     return segments
   return parse_legal_document(text)
+
+@dataclass
+class Chunk:
+    chunk_id: str
+    text: str
+    article_numbers: List[int] = field(default_factory=list)
+    effective_mode: str = None
+    file_name: str = None
+
+# 1. Fixed-Width Chunking
+def fixed_width_chunking(articles, chunk_size=3, overlap=1):
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be > 0")
+
+    if overlap >= chunk_size:
+        raise ValueError("overlap must be smaller than chunk_size")
+
+    chunks = []
+    step = chunk_size - overlap
+
+    for i in range(0, len(articles), step):
+        chunk = articles[i:i + chunk_size]
+
+        if chunk:  # avoid empty
+            chunks.append(chunk)
+
+    return chunks
+
+def boost_nodes_with_articles(nodes, query):
+    query_articles = ArabicArticleExtractor.extract(query)
+
+    for node in nodes:
+        node.score = node.score or 0.0
+
+        if query_articles:
+            chunk_articles = node.metadata.get("Article", [])
+
+            if any(a in chunk_articles for a in query_articles):
+                node.score += 1.0
+
+    return nodes
 
 class Source(BaseModel):
     document: str
@@ -404,29 +448,60 @@ class Pipeline:
 
         # Zakaria custom chunking goes here
         #-----------------------
-        chunk_docs = []
-
         for doc in self.documents:
-            chunks = split_by_articles(doc.text)
+            split_articles = split_by_articles(doc.text)
+            chunks_list = fixed_width_chunking(split_articles, chunk_size=6, overlap=2)
 
-            for chunk in chunks:
-                section = ArabicArticleExtractor.extract(chunk)
-                chunk_type = QueryAnalyzer.classify(chunk)
+            if not chunks_list:
+                raise ValueError("chunks_list is empty — nothing to index.")
 
-                metadata = {
-                    **doc.metadata,
-                    "المادة": section,
-                    "Type": chunk_type,
-                    "FileName": doc.metadata.get("file_name", "Unknown")
-                }
-
-                chunk_docs.append(
-                    Document(
-                        text=chunk,
-                        metadata=metadata
+            chunks: List[Chunk] = []
+            for i, article_strings in enumerate(chunks_list):
+                if not isinstance(article_strings, list):
+                    raise TypeError(
+                        f"chunk {i} is {type(article_strings).__name__}, expected list. "
+                        "Each chunk must be a list of article strings (or a list of lists of strings)."
                     )
-                )
+
+                # Flatten one extra nesting level if articles are themselves lists
+                # Supports both List[str] and List[List[str]] chunk formats
+                flat: List[str] = []
+                for item in article_strings:
+                    if isinstance(item, list):
+                        flat.extend(item)  # unwrap inner list → List[List[str]] case
+                    elif isinstance(item, str):
+                        flat.append(item)  # already a string → List[str] case
+                    # silently skip anything else (None, empty lists, etc.)
+
+                # Join into a single text block for embedding & article parsing
+                text = "\n".join(s.strip() for s in flat if isinstance(s, str) and s.strip())
+                if not text:
+                    continue  # skip empty chunks entirely
+                chunks.append(Chunk(chunk_id=f"chunk_{i}",
+                                    text=text,
+                                    article_numbers=ChunkArticleParser.parse(text),
+                                    effective_mode=QueryAnalyzer.classify(text),
+                                    file_name=doc.metadata.get("file_name"))
+                              )
+
         #-----------------------
+
+        final_chunks = []
+
+        for chunk in chunks:
+            final_chunks.append(
+                Document(
+                    text=chunk.text,
+                    metadata={
+                        "chunk_id": chunk.chunk_id,
+                        "article_numbers": chunk.article_numbers,
+                        "effective_mode": chunk.effective_mode,
+                        "file_name": chunk.file_name,
+                    }
+                )
+            )
+
+        print(f"Indexed {len(final_chunks)} Chunks")
 
         dimension = 4096
 
@@ -434,7 +509,7 @@ class Pipeline:
         vector_store = FaissVectorStore(faiss_index=faiss_index)
 
         self.index = VectorStoreIndex.from_documents(
-            chunk_docs,
+            final_chunks,
             vector_store=vector_store
         )
 
@@ -454,10 +529,10 @@ class Pipeline:
         from llama_index.retrievers.bm25 import BM25Retriever
         from llama_index.core.postprocessor import SentenceTransformerRerank
 
-        output_parser = PydanticOutputParser(output_cls=RequirementsOutput)
+        output_format = PydanticOutputParser(output_cls=RequirementsOutput)
 
         program = LLMTextCompletionProgram.from_defaults(
-            output_parser=output_parser,
+            output_parser=output_format,
             prompt=prompt,
             llm=Settings.llm,
             verbose=True,
@@ -469,7 +544,16 @@ class Pipeline:
             device="cpu"
         )
 
-        retriever = self.index.as_retriever(similarity_top_k=25)
+        query_mode = QueryAnalyzer.classify(user_message)
+        retriever = self.index.as_retriever(
+            similarity_top_k=25,
+            filters=MetadataFilters(
+                filters=[
+                    MetadataFilter(key="EffectiveMode", value=query_mode)
+                ]
+            )
+        )
+
         bm25_retriever = BM25Retriever.from_defaults(
             nodes=list(self.index.docstore.docs.values()),
             similarity_top_k=25
@@ -478,13 +562,14 @@ class Pipeline:
         retriever = QueryFusionRetriever(
             [retriever, bm25_retriever],
             similarity_top_k=3,
-            num_queries=1,
+            num_queries=3,
             mode="reciprocal_rerank",
             use_async=False,
         )
 
         nodes = retriever.retrieve(user_message)
-        reranked_nodes = reranker.postprocess_nodes(nodes, query_str=user_message)
+        boosted_nodes = boost_nodes_with_articles(nodes, user_message)
+        reranked_nodes = reranker.postprocess_nodes(boosted_nodes, query_str=user_message)
 
         context = "\n\n".join([
             f"[Document: {node.metadata.get('file_name', 'unknown')}]\n{node.text}"
@@ -496,6 +581,7 @@ class Pipeline:
             print(f"\n--- CHUNK {i + 1} ---")
             print("METADATA:", node.metadata)
             print("TEXT:", node.text)
+            print("SCORE:", node.score)
         print("===========================\n")
 
         try:
