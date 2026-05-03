@@ -12,6 +12,8 @@ import os
 import sys
 
 os.environ["TIKA_SERVER_ENDPOINT"] = "http://localhost:9998"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+os.environ["HF_HUB_OFFLINE"] = "1"
 
 from typing import List, Union, Generator, Iterator
 from dotenv import load_dotenv
@@ -72,6 +74,7 @@ class Pipeline:
     def __init__(self):
         self.documents = None
         self.index = None
+        self.reranker = None  # add this
 
         self.valves = self.Valves(
             **{
@@ -85,6 +88,7 @@ class Pipeline:
         from llama_index.embeddings.ollama import OllamaEmbedding
         from llama_index.llms.ollama import Ollama
         from llama_index.core import Settings, VectorStoreIndex
+        from llama_index.core.postprocessor import SentenceTransformerRerank
 
         Settings.embed_model = OllamaEmbedding(
             model_name=self.valves.LLAMAINDEX_EMBEDDING_MODEL_NAME,
@@ -94,6 +98,12 @@ class Pipeline:
             model=self.valves.LLAMAINDEX_MODEL_NAME,
             base_url=self.valves.LLAMAINDEX_OLLAMA_BASE_URL,
             request_timeout=300.0,
+        )
+
+        self.reranker = SentenceTransformerRerank(
+            model="BAAI/bge-reranker-v2-gemma",
+            top_n=6,
+            device="cpu",
         )
 
         self.documents = load_documents_with_tika("./data")
@@ -165,7 +175,6 @@ class Pipeline:
         from llama_index.core import Settings
         from llama_index.core.retrievers import QueryFusionRetriever
         from llama_index.retrievers.bm25 import BM25Retriever
-        from llama_index.core.postprocessor import SentenceTransformerRerank
 
         output_format = PydanticOutputParser(output_cls=RequirementsOutput)
 
@@ -174,12 +183,6 @@ class Pipeline:
             prompt=prompt,
             llm=Settings.llm,
             verbose=True,
-        )
-
-        reranker = SentenceTransformerRerank(
-            model="BAAI/bge-reranker-v2-gemma",
-            top_n=6,
-            device="cpu",
         )
 
         query_mode = QueryAnalyzer.classify(user_message)
@@ -208,7 +211,7 @@ class Pipeline:
 
         nodes = retriever.retrieve(user_message)
         boosted_nodes = boost_nodes_with_articles(nodes, user_message)
-        reranked_nodes = reranker.postprocess_nodes(boosted_nodes, query_str=user_message)
+        reranked_nodes = self.reranker.postprocess_nodes(boosted_nodes, query_str=user_message)
 
         context = "\n\n".join([
             f"[Document: {node.metadata.get('file_name', 'unknown')}]\n{node.text}"
