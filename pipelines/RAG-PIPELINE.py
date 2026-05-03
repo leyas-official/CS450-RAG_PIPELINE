@@ -27,8 +27,12 @@ from utils import load_documents_with_tika, split_by_articles, fixed_width_chunk
 
 load_dotenv()
 
-prompt_template = """You are an expert system analyst specializing in legal and software requirements. 
-Your task is to extract functional requirements from the provided Arabic legal text chunk (e.g., "مادة 50").
+prompt_template = """You are an expert system analyst specializing in legal and software requirements.
+Your task is to extract functional requirements from the provided Arabic legal text chunk.
+
+**IMPORTANT: The user is asking about article "{target_article}" ONLY (e.g., مادة 50).
+If the text contains multiple articles, you MUST ignore all other articles and extract requirements ONLY from "{target_article}".
+If "{target_article}" is not found in the text, return an empty requirements list.**
 
 Identify statements that express rules:
 - Obligations (e.g., يجب, يلتزم)
@@ -37,18 +41,22 @@ Identify statements that express rules:
 
 EXTRACTION RULES:
 1. Translate the extracted requirement into CLEAR ARABIC.
-2. Structure each requirement logically following this Arabic pattern: 
-   "[الفاعل] يجب/يجوز أن [الفعل] [الشروط]" 
-   (Example: "النظام يجب أن يرفض الطلب إذا كان غير مكتمل")
-3. If the actor (الفاعل) is not explicitly stated, you MUST infer a reasonable system actor (e.g., "النظام" (The system), "المستخدم" (The user), "المسؤول" (The admin)).
+2. Structure each requirement logically following this Arabic pattern:
+"[الفاعل] يجب/يجوز أن [الفعل] [الشروط]"
+(Example: "النظام يجب أن يرفض الطلب إذا كان غير مكتمل")
+3. If the actor (الفاعل) is not explicitly stated, infer a reasonable system actor.
 4. Keep the output concise. Limit to the core functional requirements.
-5. You MUST output ONLY valid JSON. Absolutely no conversational text, no greetings, and no explanations before or after the JSON.
+5. You MUST output ONLY valid JSON. No conversational text before or after.
 
 {format_instructions}
 
 Arabic Text to Analyze:
 {context}
 """
+
+prompt = PromptTemplate(
+    template=prompt_template
+)
 
 # prompt = PromptTemplate(prompt_template)
 
@@ -174,6 +182,8 @@ class Pipeline:
         )
 
         query_mode = QueryAnalyzer.classify(user_message)
+        queried_articles = ArabicArticleExtractor.extract(user_message)
+        target_article = ", ".join(f"مادة {a}" for a in queried_articles) if queried_articles else "غير محدد"
 
         vector_retriever = self.index.as_retriever(
             similarity_top_k=25,
@@ -213,7 +223,7 @@ class Pipeline:
         print("===========================\n")
 
         try:
-            result = program(context=context)
+            result = program(context=context, target_article=target_article)
         except Exception as e:
             return f"Parsing error: {e}"
 
