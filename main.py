@@ -133,6 +133,19 @@ def install_frontmatter_requirements(requirements):
 async def load_module_from_path(module_name, module_path):
 
     try:
+        # Add the pipeline's directory to sys.path so local imports work
+        pipeline_dir = os.path.dirname(os.path.abspath(module_path))
+        if pipeline_dir not in sys.path:
+            sys.path.insert(0, pipeline_dir)
+
+        # DEBUG - remove after fixing
+        print("=== PATH DEBUG ===")
+        print(f"module_path: {module_path}")
+        print(f"pipeline_dir: {pipeline_dir}")
+        print(f"sys.path: {sys.path}")
+        print(f"Contents of pipeline_dir: {os.listdir(pipeline_dir)}")
+        print("==================")
+
         # Read the module content
         with open(module_path, "r") as file:
             content = file.read()

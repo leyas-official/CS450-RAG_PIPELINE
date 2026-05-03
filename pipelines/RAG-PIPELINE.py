@@ -9,21 +9,23 @@ requirements: llama-index, llama-index-llms-ollama, llama-index-embeddings-ollam
 """
 
 import os
+import sys
+
 os.environ["TIKA_SERVER_ENDPOINT"] = "http://localhost:9998"
 
 from typing import List, Union, Generator, Iterator
 from dotenv import load_dotenv
 from llama_index.vector_stores.faiss import FaissVectorStore
 from llama_index.core.vector_stores import MetadataFilters, MetadataFilter
-from llama_index.core import Document
-# from llama_index.core.prompts import PromptTemplate
+from llama_index.core import Document, PromptTemplate
 from llama_index.core.program import LLMTextCompletionProgram
 from llama_index.core.output_parsers import PydanticOutputParser
 from pydantic import BaseModel
 import faiss
 
-from core import ArabicArticleExtractor, ChunkArticleParser, QueryAnalyzer, Chunk, RequirementsOutput
-from utils import load_documents_with_tika, split_by_articles, fixed_width_chunking, boost_nodes_with_articles
+from pipeline_core.arabic_processing import ArabicArticleExtractor, ChunkArticleParser, QueryAnalyzer
+from pipeline_core.models import Chunk, RequirementsOutput
+from pipeline_utils import load_documents_with_tika, split_by_articles, fixed_width_chunking, boost_nodes_with_articles
 
 load_dotenv()
 
@@ -45,7 +47,7 @@ EXTRACTION RULES:
 "[الفاعل] يجب/يجوز أن [الفعل] [الشروط]"
 (Example: "النظام يجب أن يرفض الطلب إذا كان غير مكتمل")
 3. If the actor (الفاعل) is not explicitly stated, infer a reasonable system actor.
-4. Keep the output concise. Limit to the core functional requirements.
+4. Keep the output concise. Limit to the pipeline_core functional requirements.
 5. You MUST output ONLY valid JSON. No conversational text before or after.
 
 {format_instructions}
@@ -57,8 +59,6 @@ Arabic Text to Analyze:
 prompt = PromptTemplate(
     template=prompt_template
 )
-
-# prompt = PromptTemplate(prompt_template)
 
 
 class Pipeline:

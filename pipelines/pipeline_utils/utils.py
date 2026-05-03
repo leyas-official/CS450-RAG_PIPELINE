@@ -139,8 +139,7 @@ def fixed_width_chunking(articles, chunk_size=3, overlap=1):
 
 
 def boost_nodes_with_articles(nodes, query):
-    from core.arabic_processing import ArabicArticleExtractor
-
+    from pipelines.pipeline_core import ArabicArticleExtractor
     query_articles = ArabicArticleExtractor.extract(query)
 
     for node in nodes:
