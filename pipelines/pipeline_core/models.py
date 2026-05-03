@@ -16,7 +16,7 @@ class Requirement(BaseModel):
     actor: str
     action: str
     conditions: str
-    priority: Literal["high", "medium", "low"]
+    priority: Optional[Literal["high", "medium", "low"]] = field(default="medium")
 
 
 class RequirementsOutput(BaseModel):

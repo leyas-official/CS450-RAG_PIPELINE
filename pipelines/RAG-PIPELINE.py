@@ -49,6 +49,7 @@ EXTRACTION RULES:
 3. If the actor (الفاعل) is not explicitly stated, infer a reasonable system actor.
 4. Keep the output concise. Limit to the pipeline_core functional requirements.
 5. You MUST output ONLY valid JSON. No conversational text before or after.
+6. priority (string): one of "high", "medium", "low" — NEVER omit this
 
 {format_instructions}
 
