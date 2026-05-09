@@ -51,7 +51,7 @@ class ChunkArticleParser:
         return sorted(set(nums))
 
 
-class QueryAnalyzer:
+class TextAnalyzer:
     """Classifies a query as 'legal' or 'general'."""
 
     _LEGAL_KEYWORDS = re.compile(

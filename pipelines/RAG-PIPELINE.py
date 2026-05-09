@@ -25,7 +25,7 @@ from llama_index.core.output_parsers import PydanticOutputParser
 from pydantic import BaseModel
 import faiss
 
-from pipeline_core.arabic_processing import ArabicArticleExtractor, ChunkArticleParser, QueryAnalyzer
+from pipeline_core.arabic_processing import ArabicArticleExtractor, ChunkArticleParser, TextAnalyzer
 from pipeline_core.models import Chunk, RequirementsOutput
 from pipeline_utils import load_documents_with_tika, split_by_articles, fixed_width_chunking, boost_nodes_with_articles
 
@@ -139,7 +139,7 @@ class Pipeline:
                     chunk_id=f"chunk_{i}",
                     text=text,
                     article_numbers=ChunkArticleParser.parse(text),
-                    effective_mode=QueryAnalyzer.classify(text),
+                    effective_mode=TextAnalyzer.classify(text),
                     file_name=doc.metadata.get("file_name"),
                 ))
 
@@ -185,7 +185,7 @@ class Pipeline:
             verbose=True,
         )
 
-        query_mode = QueryAnalyzer.classify(user_message)
+        query_mode = TextAnalyzer.classify(user_message)
         queried_articles = ArabicArticleExtractor.extract(user_message)
         target_article = ", ".join(f"مادة {a}" for a in queried_articles) if queried_articles else "غير محدد"
 
