@@ -2,66 +2,105 @@
 title: Llama Index Ollama Pipeline
 author: open-webui
 date: 2024-05-30
-version: 1.0
+version: 2.0
 license: MIT
-description: A pipeline for retrieving relevant information from a knowledge base using the Llama Index library with Ollama embeddings.
+description: A NotebookLM-style pipeline for querying Arabic legal documents
+             with a focus on functional requirements extraction.
 requirements: llama-index, llama-index-llms-ollama, llama-index-embeddings-ollama
 """
 
 import os
-import sys
-
-os.environ["TIKA_SERVER_ENDPOINT"] = "http://localhost:9998"
-os.environ["TRANSFORMERS_OFFLINE"] = "1"
-os.environ["HF_HUB_OFFLINE"] = "1"
-
 from typing import List, Union, Generator, Iterator
 from dotenv import load_dotenv
 from llama_index.vector_stores.faiss import FaissVectorStore
 from llama_index.core.vector_stores import MetadataFilters, MetadataFilter
 from llama_index.core import Document, PromptTemplate
-from llama_index.core.program import LLMTextCompletionProgram
-from llama_index.core.output_parsers import PydanticOutputParser
 from pydantic import BaseModel
 import faiss
 
-from pipeline_core.arabic_processing import ArabicArticleExtractor, ChunkArticleParser, TextAnalyzer
-from pipeline_core.models import Chunk, RequirementsOutput
+from pipeline_core.arabic_processing import ArabicArticleExtractor, ChunkArticleParser, TextAnalyzer, ActorExtractor
 from pipeline_utils import load_documents_with_tika, split_by_articles, fixed_width_chunking, boost_nodes_with_articles
+from pipelines.pipeline_core import Chunk
 
 load_dotenv()
 
-prompt_template = """You are an expert system analyst specializing in legal and software requirements.
-Your task is to extract functional requirements from the provided Arabic legal text chunk.
+prompt_template = """أنت محلل متطلبات برمجية متخصص في استخلاص المتطلبات الوظيفية من الوثائق القانونية والتشريعية العربية،
+بهدف تحويلها إلى متطلبات نظام قابلة للتنفيذ من قِبل فريق هندسة البرمجيات.
 
-**IMPORTANT: The user is asking about article "{target_article}" ONLY (e.g., مادة 50).
-If the text contains multiple articles, you MUST ignore all other articles and extract requirements ONLY from "{target_article}".
-If "{target_article}" is not found in the text, return an empty requirements list.**
+{article_instruction}
 
-Identify statements that express rules:
-- Obligations (e.g., يجب, يلتزم)
-- Prohibitions (e.g., لا يجوز, يُحظر)
-- Permissions or rights (e.g., يجوز, يحق)
+**تعريف المتطلب الوظيفي في سياق هندسة البرمجيات:**
+المتطلب الوظيفي هو وصف لما يجب أن يفعله النظام البرمجي بشكل مباشر وقابل للتنفيذ.
+كل متطلب يجب أن يكون قابلاً للترجمة إلى كود، endpoint، قاعدة عمل، أو تدفق بيانات.
 
-EXTRACTION RULES:
-1. Translate the extracted requirement into CLEAR ARABIC.
-2. Structure each requirement logically following this Arabic pattern:
-"[الفاعل] يجب/يجوز أن [الفعل] [الشروط]"
-(Example: "النظام يجب أن يرفض الطلب إذا كان غير مكتمل")
-3. If the actor (الفاعل) is not explicitly stated, infer a reasonable system actor.
-4. Keep the output concise. Limit to the pipeline_core functional requirements.
-5. You MUST output ONLY valid JSON. No conversational text before or after.
-6. priority (string): one of "high", "medium", "low" — NEVER omit this
+- **الالتزامات (Obligations):** ما يجب أن ينفذه النظام تلقائياً أو عند حدث معين
+  مستخلص من: يجب، يلتزم، يتعين
+  أمثلة برمجية:
+  - النظام يجب أن يرسل إشعاراً تلقائياً عند انتهاء صلاحية الترخيص
+  - النظام يجب أن يحفظ سجل بكل عملية تقديم مع timestamp
+  - النظام يجب أن يتحقق من اكتمال الحقول الإلزامية قبل قبول الطلب
 
-{format_instructions}
+- **القيود (Constraints):** ما يجب أن يرفضه أو يمنعه النظام على مستوى validation أو access control
+  مستخلص من: لا يجوز، يُحظر، يُمنع
+  أمثلة برمجية:
+  - النظام يجب أن يمنع تقديم طلب جديد إذا كان هناك طلب معلق لنفس المستخدم
+  - النظام يجب أن يرفض رفع ملف يتجاوز الحجم المحدد أو بصيغة غير مدعومة
+  - النظام يجب أن يحجب الوصول إذا لم تكتمل شروط التسجيل
 
-Arabic Text to Analyze:
+- **الصلاحيات (Permissions/Rights):** ما يتيحه النظام لأدوار معينة على مستوى role-based access
+  مستخلص من: يجوز، يحق، يُتيح
+  أمثلة برمجية:
+  - المدير فقط يملك صلاحية الاطلاع على تقارير جميع المستخدمين
+  - يُتاح للمتقدم تعديل بياناته فقط قبل إغلاق باب التقديم
+  - يحق للجهة المختصة إلغاء الطلب وإعادته للمراجعة في أي مرحلة
+
+- **الشروط (Conditions):** منطق if/then قابل للتنفيذ كـ business rules أو workflow transitions
+  مستخلص من: إذا، في حال، متى، بشرط
+  أمثلة برمجية:
+  - إذا تجاوزت مدة المراجعة 30 يوماً → يُصدر النظام تنبيهاً تلقائياً للمسؤول
+  - في حال رفض الطلب → يجب أن يُسجّل النظام سبب الرفض ويُرسله للمتقدم
+  - إذا لم يستوفِ المتقدم الشروط → يُوقف النظام تقدمه في الخطوة التالية
+
+**ما لا يُعدّ متطلباً وظيفياً قابلاً للبرمجة — تجاهله تماماً:**
+هذه المتطلبات تخص السلوك الإنساني والانضباط المؤسسي ولا يمكن ترجمتها إلى كود برمجي:
+- الالتزامات الأخلاقية والسلوكية (مثل: يجب أن يتحلى الموظف بالأمانة)
+- قواعد الانضباط الوظيفي (مثل: يُحظر على الموظف الإخلال بالنظام)
+- العقوبات والجزاءات التأديبية (مثل: يُعاقب على المخالفة بالفصل أو الغرامة)
+- الالتزامات الأخلاقية تجاه الزملاء أو المجتمع
+- أي متطلب لا يمكن ترجمته إلى: واجهة مستخدم، قاعدة بيانات، API، قاعدة عمل برمجية، أو تدفق نظام
+
+**اسأل نفسك قبل إدراج أي متطلب: هل يمكن برمجة هذا في نظام معلومات؟**
+- إذا كانت الإجابة نعم → أدرجه
+- إذا كانت الإجابة لا → تجاهله تماماً ولا تذكره
+
+**تعليمات الإجابة:**
+- أجب على سؤال المستخدم بالعربية الفصحى من منظور هندسة المتطلبات البرمجية.
+- لكل متطلب وظيفي تستخلصه، اذكر:
+  - **المصدر (Source):** رقم المادة التي استُخلص منها المتطلب (مثل: المادة 5، المادة 12)
+  - **الفاعل (Actor):** من يقوم بالفعل أو من يتأثر به (مستخدم، نظام، جهة خارجية)
+  - **الفعل (Action):** ما الذي يجب أن يحدث
+  - **الشرط (Condition):** متى أو في أي حالة يُطبَّق هذا المتطلب (إن وُجد)
+- إذا كان المتطلب مستخلصاً من أكثر من مادة، اذكر جميع المواد المعنية.
+- استند فقط إلى المقاطع المسترجعة أدناه، ولا تستنتج متطلبات غير موجودة في النص.
+- إذا لم تجد إجابة كافية في النصوص المقدمة، صرّح بذلك بوضوح.
+
+**سؤال المستخدم:**
+{user_message}
+
+**المقاطع المسترجعة من الوثائق:**
 {context}
 """
 
-prompt = PromptTemplate(
-    template=prompt_template
-)
+prompt = PromptTemplate(template=prompt_template)
+
+ARTICLE_INSTRUCTION_TEMPLATE = """**تنبيه:** المستخدم يسأل عن {target_article} تحديداً.
+ركّز إجابتك على ما يخص هذه المادة/المواد فقط، وتجاهل المحتوى غير المرتبط بها."""
+
+NO_ARTICLE_INSTRUCTION = """**نطاق البحث:** السؤال عام ويشمل جميع الوثائق المتاحة.
+أجب بناءً على أكثر المقاطع صلةً بالسؤال."""
+
+ACTOR_INSTRUCTION_TEMPLATE = """**تنبيه:** المستخدم يسأل عن الفاعل/الطرف: {actors}.
+ركّز إجابتك على المواد التي يظهر فيها هذا الطرف، واستخرج المتطلبات الوظيفية المرتبطة به تحديداً."""
 
 
 class Pipeline:
@@ -74,7 +113,7 @@ class Pipeline:
     def __init__(self):
         self.documents = None
         self.index = None
-        self.reranker = None  # add this
+        self.reranker = None
 
         self.valves = self.Valves(
             **{
@@ -106,6 +145,7 @@ class Pipeline:
             device="cpu",
         )
 
+        # Documents are already loaded via Tika from an external source
         self.documents = load_documents_with_tika("./data")
         print(f"Loaded docs: {len(self.documents)}")
 
@@ -113,16 +153,14 @@ class Pipeline:
 
         for doc in self.documents:
             split_articles = split_by_articles(doc.text)
-            chunks_list = fixed_width_chunking(split_articles, chunk_size=6, overlap=2)
+            chunks_list = fixed_width_chunking(split_articles, chunk_size=8, overlap=2)
 
             if not chunks_list:
                 raise ValueError("chunks_list is empty — nothing to index.")
 
             for i, article_strings in enumerate(chunks_list):
                 if not isinstance(article_strings, list):
-                    raise TypeError(
-                        f"chunk {i} is {type(article_strings).__name__}, expected list."
-                    )
+                    raise TypeError(f"chunk {i} is {type(article_strings).__name__}, expected list.")
 
                 flat: List[str] = []
                 for item in article_strings:
@@ -143,6 +181,44 @@ class Pipeline:
                     file_name=doc.metadata.get("file_name"),
                 ))
 
+        # --- Actor extraction pass ---
+        actor_extraction_prompt = """أنت محلل نصوص قانونية. مهمتك استخراج الفاعلين (الأطراف) من النص القانوني التالي.
+        الفاعل هو أي طرف يُذكر كمنفذ لفعل أو مُلزَم بالتزام أو صاحب حق.
+        أمثلة: الطالب، المرخص له، الجهة المختصة، المؤسسة، المدير، الموظف.
+
+        أعد قائمة الفاعلين فقط، كل فاعل في سطر مستقل، بدون ترقيم أو شرح.
+        إذا لم يوجد فاعل واضح، أعد كلمة: لا يوجد
+
+        النص:
+        {text}"""
+
+        print(f"Extracting actors from {len(chunks)} chunks...")
+
+        for i, chunk in enumerate(chunks):
+            try:
+                response = Settings.llm.complete(
+                    actor_extraction_prompt.format(text=chunk.text)
+                )
+                raw = response.text.strip()
+
+                if "لا يوجد" in raw:
+                    chunk.actors = []
+                else:
+                    chunk.actors = [
+                        line.strip()
+                        for line in raw.splitlines()
+                        if line.strip()
+                    ]
+
+                print(f"  [{i + 1}/{len(chunks)}] {chunk.chunk_id} → actors: {chunk.actors}")
+
+            except Exception as e:
+                print(f"  [ERROR] {chunk.chunk_id}: {e}")
+                chunk.actors = []
+
+        print("Actor extraction complete.")
+        # ----------------------------
+
         final_chunks = [
             Document(
                 text=chunk.text,
@@ -151,18 +227,16 @@ class Pipeline:
                     "article_numbers": chunk.article_numbers,
                     "effective_mode": chunk.effective_mode,
                     "file_name": chunk.file_name,
+                    "actors": chunk.actors,
                 }
             )
             for chunk in chunks
         ]
 
-        print(f"Indexed {len(final_chunks)} Chunks")
-
         faiss_index = faiss.IndexFlatL2(4096)
         vector_store = FaissVectorStore(faiss_index=faiss_index)
-
         self.index = VectorStoreIndex.from_documents(
-            final_chunks,
+            documents=final_chunks,
             vector_store=vector_store,
         )
 
@@ -176,26 +250,48 @@ class Pipeline:
         from llama_index.core.retrievers import QueryFusionRetriever
         from llama_index.retrievers.bm25 import BM25Retriever
 
-        output_format = PydanticOutputParser(output_cls=RequirementsOutput)
-
-        program = LLMTextCompletionProgram.from_defaults(
-            output_parser=output_format,
-            prompt=prompt,
-            llm=Settings.llm,
-            verbose=True,
-        )
-
-        query_mode = TextAnalyzer.classify(user_message)
         queried_articles = ArabicArticleExtractor.extract(user_message)
-        target_article = ", ".join(f"مادة {a}" for a in queried_articles) if queried_articles else "غير محدد"
+        queried_actors = ActorExtractor.extract(user_message, llm=Settings.llm)
 
-        vector_retriever = self.index.as_retriever(
-            similarity_top_k=25,
-            filters=MetadataFilters(
-                filters=[MetadataFilter(key="EffectiveMode", value=query_mode)]
-            ),
-        )
+        if queried_articles:
+            target_article = ", ".join(f"مادة {a}" for a in queried_articles)
+            article_instruction = ARTICLE_INSTRUCTION_TEMPLATE.format(target_article=target_article)
 
+            vector_retriever = self.index.as_retriever(
+                similarity_top_k=25,
+                filters=MetadataFilters(
+                    filters=[MetadataFilter(key="article_numbers", value=a) for a in queried_articles],
+                ),
+            )
+
+        elif queried_actors:
+            # User asked about a specific actor e.g. "الطالب"
+            article_instruction = ACTOR_INSTRUCTION_TEMPLATE.format(
+                actors=", ".join(queried_actors)
+            )
+
+            vector_retriever = self.index.as_retriever(
+                similarity_top_k=40,  # cast wider net since actor may appear in many chunks
+                filters=MetadataFilters(
+                    filters=[MetadataFilter(key="actors", value=a) for a in queried_actors],
+                    condition="or",  # match any of the actors, not all
+                ),
+            )
+
+        else:
+            # General question — no article or actor detected
+            article_instruction = NO_ARTICLE_INSTRUCTION
+
+            vector_retriever = self.index.as_retriever(
+                similarity_top_k=25,
+            )
+
+            # Broad retrieval across all documents when no article is specified
+            vector_retriever = self.index.as_retriever(
+                similarity_top_k=25,
+            )
+
+        # --- Hybrid retrieval: vector + BM25 ---
         bm25_retriever = BM25Retriever.from_defaults(
             nodes=list(self.index.docstore.docs.values()),
             similarity_top_k=25,
@@ -203,32 +299,41 @@ class Pipeline:
 
         retriever = QueryFusionRetriever(
             [vector_retriever, bm25_retriever],
-            similarity_top_k=3,
-            num_queries=3,
+            similarity_top_k=20,
+            num_queries=4,
             mode="reciprocal_rerank",
             use_async=False,
         )
 
         nodes = retriever.retrieve(user_message)
         boosted_nodes = boost_nodes_with_articles(nodes, user_message)
-        reranked_nodes = self.reranker.postprocess_nodes(boosted_nodes, query_str=user_message)
+
+        if queried_articles:
+            reranked_nodes = self.reranker.postprocess_nodes(boosted_nodes, query_str=user_message)
+        else:
+            reranked_nodes = boosted_nodes
 
         context = "\n\n".join([
-            f"[Document: {node.metadata.get('file_name', 'unknown')}]\n{node.text}"
+            f"[المصدر: {node.metadata.get('file_name', 'غير معروف')}]\n{node.text}"
             for node in reranked_nodes
         ])
 
         print("\n===== RETRIEVED CHUNKS =====")
-        for i, node in enumerate(nodes):
+        for i, node in enumerate(reranked_nodes):
             print(f"\n--- CHUNK {i + 1} ---")
             print("METADATA:", node.metadata)
             print("TEXT:", node.text)
             print("SCORE:", node.score)
         print("===========================\n")
 
-        try:
-            result = program(context=context, target_article=target_article)
-        except Exception as e:
-            return f"Parsing error: {e}"
+        formatted_prompt = prompt.format(
+            article_instruction=article_instruction,
+            user_message=user_message,
+            context=context,
+        )
 
-        return result.model_dump_json(indent=2)
+        try:
+            response = Settings.llm.complete(formatted_prompt)
+            return response.text
+        except Exception as e:
+            return f"خطأ أثناء المعالجة: {e}"

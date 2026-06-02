@@ -67,3 +67,32 @@ class TextAnalyzer:
         if cls._LEGAL_KEYWORDS.search(query):
             return "legal"
         return "general"
+
+
+class ActorExtractor:
+    _prompt = """أنت محلل نصوص قانونية. مهمتك تحديد الأطراف/الفاعلين المذكورين في سؤال المستخدم.
+الفاعل هو أي طرف يُذكر في السؤال كمحور البحث، مثل: الطالب، المرخص له، الجهة المختصة.
+
+أعد أسماء الفاعلين فقط، كل فاعل في سطر مستقل، بدون ترقيم أو شرح.
+إذا لم يوجد فاعل واضح في السؤال، أعد كلمة: لا يوجد
+
+السؤال:
+{text}"""
+
+    @classmethod
+    def extract(cls, text: str, llm) -> List[str]:
+        try:
+            response = llm.complete(cls._prompt.format(text=text))
+            raw = response.text.strip()
+
+            if "لا يوجد" in raw:
+                return []
+
+            return [
+                line.strip()
+                for line in raw.splitlines()
+                if line.strip()
+            ]
+        except Exception as e:
+            print(f"[ActorExtractor ERROR] {e}")
+            return []

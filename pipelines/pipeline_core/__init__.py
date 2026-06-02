@@ -1,2 +1,2 @@
-from .arabic_processing import ArabicArticleExtractor, ChunkArticleParser, TextAnalyzer
-from .models import Chunk, Requirement, RequirementsOutput, Source
+from .arabic_processing import ArabicArticleExtractor, ChunkArticleParser, TextAnalyzer, ActorExtractor
+from .models import Chunk, Source
