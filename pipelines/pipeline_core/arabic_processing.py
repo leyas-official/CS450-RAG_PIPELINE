@@ -60,6 +60,12 @@ class TextAnalyzer:
         re.UNICODE,
     )
 
+    _DISCIPLINARY_KEYWORDS = [
+        "مخالفة", "عقوبة", "تأديب", "جزاء", "فصل", "إنذار",
+        "اعتداء", "شجار", "ضرب", "غش", "انتحال", "شغب",
+        "إيذاء", "إتلاف", "استيلاء", "تزوير", "تهديد"
+    ]
+
     @classmethod
     def classify(cls, query: str) -> str:
         if ArabicArticleExtractor.extract(query):
@@ -68,6 +74,9 @@ class TextAnalyzer:
             return "legal"
         return "general"
 
+    @classmethod
+    def is_disciplinary(cls, article_text: str) -> bool:
+        return sum(kw in article_text for kw in cls._DISCIPLINARY_KEYWORDS) >= 2
 
 class ActorExtractor:
     _prompt = """أنت محلل نصوص قانونية. مهمتك تحديد الأطراف/الفاعلين المذكورين في سؤال المستخدم.

@@ -21,6 +21,7 @@ import faiss
 from pipeline_core.arabic_processing import ArabicArticleExtractor, ChunkArticleParser, TextAnalyzer, ActorExtractor
 from pipeline_utils import load_documents_with_tika, split_by_articles, fixed_width_chunking, boost_nodes_with_articles
 from pipelines.pipeline_core import Chunk
+from pipelines.pipeline_utils.utils import boost_nodes_with_actors, actor_matches
 
 load_dotenv()
 
@@ -153,7 +154,8 @@ class Pipeline:
 
         for doc in self.documents:
             split_articles = split_by_articles(doc.text)
-            chunks_list = fixed_width_chunking(split_articles, chunk_size=8, overlap=2)
+            split_articles = [a for a in split_articles if not TextAnalyzer.is_disciplinary(a)]
+            chunks_list = fixed_width_chunking(split_articles, chunk_size=1, overlap=0)
 
             if not chunks_list:
                 raise ValueError("chunks_list is empty — nothing to index.")
@@ -253,60 +255,82 @@ class Pipeline:
         queried_articles = ArabicArticleExtractor.extract(user_message)
         queried_actors = ActorExtractor.extract(user_message, llm=Settings.llm)
 
+        tok_k = 0
         if queried_articles:
+            print("Queried articles FOUND")
             target_article = ", ".join(f"مادة {a}" for a in queried_articles)
             article_instruction = ARTICLE_INSTRUCTION_TEMPLATE.format(target_article=target_article)
 
             vector_retriever = self.index.as_retriever(
-                similarity_top_k=25,
+                similarity_top_k=20,
                 filters=MetadataFilters(
                     filters=[MetadataFilter(key="article_numbers", value=a) for a in queried_articles],
                 ),
             )
 
+            # Filter BM25 nodes to only chunks containing the queried articles
+            filtered_nodes = [
+                node for node in self.index.docstore.docs.values()
+                if any(a in node.metadata.get("article_numbers", []) for a in queried_articles)
+            ]
+
+            if not filtered_nodes:
+                print("[WARNING] No chunks matched article filter, falling back to full docstore")
+                filtered_nodes = list(self.index.docstore.docs.values())
+
+            top_k = 25
+
         elif queried_actors:
-            # User asked about a specific actor e.g. "الطالب"
             article_instruction = ACTOR_INSTRUCTION_TEMPLATE.format(
                 actors=", ".join(queried_actors)
             )
 
+            filtered_nodes = [
+                node for node in self.index.docstore.docs.values()
+                if actor_matches(node.metadata.get("actors", []), queried_actors)
+            ]
+
+            if not filtered_nodes:
+                print("[WARNING] No chunks matched actor filter, falling back to full docstore")
+                filtered_nodes = list(self.index.docstore.docs.values())
+                top_k = 25  # fallback to reasonable default since we're now searching everything
+            else:
+                top_k = len(filtered_nodes)
+
             vector_retriever = self.index.as_retriever(
-                similarity_top_k=40,  # cast wider net since actor may appear in many chunks
+                similarity_top_k=top_k,
                 filters=MetadataFilters(
                     filters=[MetadataFilter(key="actors", value=a) for a in queried_actors],
-                    condition="or",  # match any of the actors, not all
+                    condition="or",
                 ),
             )
 
         else:
-            # General question — no article or actor detected
+            top_k = 25
+
             article_instruction = NO_ARTICLE_INSTRUCTION
+            vector_retriever = self.index.as_retriever(similarity_top_k=top_k)
 
-            vector_retriever = self.index.as_retriever(
-                similarity_top_k=25,
-            )
+            # No filter — search everything
+            filtered_nodes = list(self.index.docstore.docs.values())
 
-            # Broad retrieval across all documents when no article is specified
-            vector_retriever = self.index.as_retriever(
-                similarity_top_k=25,
-            )
 
-        # --- Hybrid retrieval: vector + BM25 ---
         bm25_retriever = BM25Retriever.from_defaults(
-            nodes=list(self.index.docstore.docs.values()),
-            similarity_top_k=25,
+            nodes=filtered_nodes,
+            similarity_top_k=top_k,
         )
 
         retriever = QueryFusionRetriever(
             [vector_retriever, bm25_retriever],
-            similarity_top_k=20,
+            similarity_top_k=top_k,
             num_queries=4,
             mode="reciprocal_rerank",
             use_async=False,
         )
 
         nodes = retriever.retrieve(user_message)
-        boosted_nodes = boost_nodes_with_articles(nodes, user_message)
+        boosted_nodes = boost_nodes_with_articles(nodes, queried_articles)
+        boosted_nodes += boost_nodes_with_actors(nodes, queried_actors)
 
         if queried_articles:
             reranked_nodes = self.reranker.postprocess_nodes(boosted_nodes, query_str=user_message)

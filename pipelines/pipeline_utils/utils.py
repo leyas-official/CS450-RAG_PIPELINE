@@ -138,10 +138,7 @@ def fixed_width_chunking(articles, chunk_size=3, overlap=1):
     return chunks
 
 
-def boost_nodes_with_articles(nodes, query):
-    from pipelines.pipeline_core import ArabicArticleExtractor
-    query_articles = ArabicArticleExtractor.extract(query)
-
+def boost_nodes_with_articles(nodes, query_articles):
     for node in nodes:
         node.score = node.score or 0.0
         if query_articles:
@@ -150,3 +147,20 @@ def boost_nodes_with_articles(nodes, query):
                 node.score += 1.0
 
     return nodes
+
+def boost_nodes_with_actors(nodes, query_actors):
+    for node in nodes:
+        node.score = node.score or 0.0
+        if query_actors:
+            chunk_actors = node.metadata.get("actors", [])
+            if any(a in chunk_actors for a in query_actors):
+                node.score += 1.0
+
+    return nodes
+
+def actor_matches(chunk_actors: list, query_actors: list) -> bool:
+    for qa in query_actors:
+        for ca in chunk_actors:
+            if qa in ca or ca in qa:
+                return True
+    return False
