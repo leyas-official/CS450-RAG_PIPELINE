@@ -23,14 +23,14 @@ from pipeline_utils import load_documents_with_tika, split_by_articles, fixed_wi
 from pipelines.pipeline_core import Chunk
 from pipelines.pipeline_utils.utils import boost_nodes_with_actors, actor_matches
 
-from pipeline_core.arabic_processing import ArabicArticleExtractor, ChunkArticleParser, TextAnalyzer, ActorExtractor
 from pipeline_core.prompts import (
     prompt,
     ARTICLE_INSTRUCTION_TEMPLATE,
     NO_ARTICLE_INSTRUCTION,
-    ACTOR_INSTRUCTION_TEMPLATE,
-    ACTOR_EXTRACTION_PROMPT
+    ACTOR_INSTRUCTION_TEMPLATE
 )
+
+from pipeline_utils.actor_utils import extract_actors_from_chunks
 
 load_dotenv()
 
@@ -113,33 +113,7 @@ class Pipeline:
                     file_name=doc.metadata.get("file_name"),
                 ))
 
-
-        print(f"Extracting actors from {len(chunks)} chunks...")
-
-        for i, chunk in enumerate(chunks):
-            try:
-                response = Settings.llm.complete(
-                    ACTOR_EXTRACTION_PROMPT.format(text=chunk.text)
-                )
-                raw = response.text.strip()
-
-                if "لا يوجد" in raw:
-                    chunk.actors = []
-                else:
-                    chunk.actors = [
-                        line.strip()
-                        for line in raw.splitlines()
-                        if line.strip()
-                    ]
-
-                print(f"  [{i + 1}/{len(chunks)}] {chunk.chunk_id} → actors: {chunk.actors}")
-
-            except Exception as e:
-                print(f"  [ERROR] {chunk.chunk_id}: {e}")
-                chunk.actors = []
-
-        print("Actor extraction complete.")
-        # ----------------------------
+        extract_actors_from_chunks(chunks, Settings.llm)
 
         final_chunks = [
             Document(

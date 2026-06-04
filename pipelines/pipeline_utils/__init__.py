@@ -4,5 +4,6 @@ from .utils import (
     fixed_width_chunking,
     boost_nodes_with_articles,
     boost_nodes_with_actors,
-    actor_matches
+    actor_matches,
 )
+from .actor_utils import extract_actors_from_chunks
