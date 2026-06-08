@@ -43,14 +43,17 @@ def split_by_articles(text):
         text = text.replace("\r\n", "\n").replace("\r", "\n")
         text = re.sub(r"\n{3,}", "\n\n", text)
         text = "\n".join(line.rstrip() for line in text.split("\n"))
+        text = re.sub(r'\)(\d+)\(', r'(\1)', text)
         return text.strip()
 
     _ARTICLE_LINE_RE = re.compile(
         r"^[ \t]*"
-        r"(?:ال)?[مM]ادة"
+        r"(?:ال|لل|بال|وال|فال)?"  # common Arabic prefixes
+        r"[مM]ادة"
         r"(?:\s+رقم)?"
-        r"\s+"
+        r"[\s(]+"
         r"(\d+)"
+        r"[)\s]*"
         r"[ \t]*$",
         re.MULTILINE | re.UNICODE,
     )

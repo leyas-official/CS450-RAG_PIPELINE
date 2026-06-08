@@ -149,7 +149,6 @@ class Pipeline:
         queried_articles = ArabicArticleExtractor.extract(user_message)
         queried_actors = ActorExtractor.extract(user_message, llm=Settings.llm)
 
-        tok_k = 0
         if queried_articles:
             print("Queried articles FOUND")
             target_article = ", ".join(f"مادة {a}" for a in queried_articles)
@@ -175,6 +174,7 @@ class Pipeline:
             top_k = 25
 
         elif queried_actors:
+            print("Queried actors FOUND")
             article_instruction = ACTOR_INSTRUCTION_TEMPLATE.format(
                 actors=", ".join(queried_actors)
             )
@@ -200,6 +200,7 @@ class Pipeline:
             )
 
         else:
+            print("else statement")
             top_k = 25
 
             article_instruction = NO_ARTICLE_INSTRUCTION
