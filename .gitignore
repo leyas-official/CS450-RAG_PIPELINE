@@ -13,4 +13,5 @@ data/
 .venv
 venv/
 storage/
+*.log
 
