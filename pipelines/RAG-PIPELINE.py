@@ -10,18 +10,26 @@ requirements: llama-index, llama-index-llms-ollama, llama-index-embeddings-ollam
 """
 
 import os
+import hashlib
 from typing import List, Union, Generator, Iterator
 from dotenv import load_dotenv
-from llama_index.vector_stores.faiss import FaissVectorStore
 from llama_index.core.vector_stores import MetadataFilters, MetadataFilter
-from llama_index.core import Document, PromptTemplate
+from llama_index.core import Document, PromptTemplate, VectorStoreIndex
+from llama_index.core import Document, StorageContext, load_index_from_storage, Settings
+from llama_index.vector_stores.faiss import FaissVectorStore
 from pydantic import BaseModel
 import faiss
+import json
 
 from pipeline_core.arabic_processing import ArabicArticleExtractor, ChunkArticleParser, TextAnalyzer, ActorExtractor
 from pipeline_utils import load_documents_with_tika, split_by_articles, fixed_width_chunking, boost_nodes_with_articles
 from pipelines.pipeline_core import Chunk
 from pipelines.pipeline_utils.utils import boost_nodes_with_actors, actor_matches
+
+from llama_index.embeddings.ollama import OllamaEmbedding
+from llama_index.llms.ollama import Ollama
+from llama_index.core import Settings
+from llama_index.core.postprocessor import SentenceTransformerRerank
 
 from pipeline_core.prompts import (
     prompt,
@@ -33,6 +41,8 @@ from pipeline_core.prompts import (
 from pipeline_utils.actor_utils import extract_actors_from_chunks
 
 load_dotenv()
+INDEXED_MANIFEST_PATH = os.getenv("INDEXED_MANIFEST_PATH")
+PERSIST_DIR = os.getenv("PERSIST_DIR")
 
 class Pipeline:
 
@@ -57,8 +67,9 @@ class Pipeline:
     async def on_startup(self):
         from llama_index.embeddings.ollama import OllamaEmbedding
         from llama_index.llms.ollama import Ollama
-        from llama_index.core import Settings, VectorStoreIndex
+        from llama_index.core import Settings, VectorStoreIndex, StorageContext, load_index_from_storage
         from llama_index.core.postprocessor import SentenceTransformerRerank
+        from llama_index.vector_stores.faiss import FaissVectorStore
 
         Settings.embed_model = OllamaEmbedding(
             model_name=self.valves.LLAMAINDEX_EMBEDDING_MODEL_NAME,
@@ -76,20 +87,90 @@ class Pipeline:
             device="cpu",
         )
 
-        # Documents are already loaded via Tika from an external source
-        self.documents = load_documents_with_tika("./data")
+        # Load the persisted index from disk if it exists, so a server
+        # restart doesn't lose everything that's already been indexed.
+        if os.path.exists(PERSIST_DIR) and os.listdir(PERSIST_DIR):
+            print(f"Loading persisted index from {PERSIST_DIR}")
+            vector_store = FaissVectorStore.from_persist_dir(PERSIST_DIR)
+            storage_context = StorageContext.from_defaults(
+                vector_store=vector_store, persist_dir=PERSIST_DIR
+            )
+            self.index = load_index_from_storage(storage_context)
+            print("Loaded persisted index.")
+        else:
+            print("No persisted index found — starting with an empty index.")
+            faiss_index = faiss.IndexFlatL2(4096)
+            vector_store = FaissVectorStore(faiss_index=faiss_index)
+            storage_context = StorageContext.from_defaults(vector_store=vector_store)
+            self.index = VectorStoreIndex(nodes=[], storage_context=storage_context)
+
+    async def index_file(self):
+        """
+        Reads the entire ./data directory via Tika, but only chunks,
+        embeds, and inserts documents whose content hash isn't already
+        in the manifest. Already-indexed files are skipped after Tika
+        extraction (Tika doesn't support skipping individual files).
+        """
+        data_dir = "./data"
+        manifest = self._load_manifest()  # filename -> hash
+        indexed_hashes = set(manifest.values())
+
+        # Load existing persisted index, or build a fresh empty one
+        if os.path.exists(PERSIST_DIR) and os.listdir(PERSIST_DIR):
+            vector_store = FaissVectorStore.from_persist_dir(PERSIST_DIR)
+            storage_context = StorageContext.from_defaults(
+                vector_store=vector_store, persist_dir=PERSIST_DIR
+            )
+            self.index = load_index_from_storage(storage_context)
+        elif getattr(self, "index", None) is None:
+            faiss_index = faiss.IndexFlatL2(4096)
+            vector_store = FaissVectorStore(faiss_index=faiss_index)
+            storage_context = StorageContext.from_defaults(vector_store=vector_store)
+            self.index = VectorStoreIndex(nodes=[], storage_context=storage_context)
+
+        # Pre-compute hashes for every file currently in ./data, so we know
+        # which ones are new BEFORE deciding whether to bother extracting them.
+        file_hashes = {}
+        for filename in os.listdir(data_dir):
+            file_path = os.path.join(data_dir, filename)
+            if not os.path.isfile(file_path):
+                continue
+            with open(file_path, "rb") as f:
+                file_hashes[filename] = hashlib.sha256(f.read()).hexdigest()
+
+        new_filenames = {
+            filename for filename, h in file_hashes.items()
+            if h not in indexed_hashes
+        }
+
+        report = []
+
+        if not new_filenames:
+            print("No new files found in ./data.")
+            return report
+
+        # One Tika pass over the whole directory, as requested
+        self.documents = load_documents_with_tika(data_dir)
         print(f"Loaded docs: {len(self.documents)}")
 
         chunks: List[Chunk] = []
 
         for doc in self.documents:
+            filename = doc.metadata.get("file_name")
+
+            # Skip documents whose file isn't new — already indexed
+            if filename not in new_filenames:
+                continue
+
             split_articles = split_by_articles(doc.text)
             split_articles = [a for a in split_articles if not TextAnalyzer.is_disciplinary(a)]
             chunks_list = fixed_width_chunking(split_articles, chunk_size=1, overlap=0)
 
             if not chunks_list:
-                raise ValueError("chunks_list is empty — nothing to index.")
+                report.append({"filename": filename, "status": False, "detail": "No usable chunks extracted."})
+                continue
 
+            file_chunks = []
             for i, article_strings in enumerate(chunks_list):
                 if not isinstance(article_strings, list):
                     raise TypeError(f"chunk {i} is {type(article_strings).__name__}, expected list.")
@@ -105,18 +186,30 @@ class Pipeline:
                 if not text:
                     continue
 
-                chunks.append(Chunk(
-                    chunk_id=f"chunk_{i}",
+                file_chunks.append(Chunk(
+                    chunk_id=f"{filename}_chunk_{i}",
                     text=text,
                     article_numbers=ChunkArticleParser.parse(text),
                     effective_mode=TextAnalyzer.classify(text),
-                    file_name=doc.metadata.get("file_name"),
+                    file_name=filename,
                 ))
 
+            if not file_chunks:
+                report.append({"filename": filename, "status": False, "detail": "No usable chunks extracted."})
+                continue
+
+            chunks.extend(file_chunks)
+            report.append({"filename": filename, "status": True, "detail": f"Indexed {len(file_chunks)} chunk(s)."})
+
+        if not chunks:
+            print("No usable chunks among new files.")
+            return report
+
+        # One batched actor-extraction call across ALL new files' chunks
         extract_actors_from_chunks(chunks, Settings.llm)
 
-        final_chunks = [
-            Document(
+        for chunk in chunks:
+            new_document = Document(
                 text=chunk.text,
                 metadata={
                     "chunk_id": chunk.chunk_id,
@@ -124,17 +217,37 @@ class Pipeline:
                     "effective_mode": chunk.effective_mode,
                     "file_name": chunk.file_name,
                     "actors": chunk.actors,
-                }
+                },
             )
-            for chunk in chunks
-        ]
+            self.index.insert(new_document)
 
-        faiss_index = faiss.IndexFlatL2(4096)
-        vector_store = FaissVectorStore(faiss_index=faiss_index)
-        self.index = VectorStoreIndex.from_documents(
-            documents=final_chunks,
-            vector_store=vector_store,
-        )
+        # Mark every newly-indexed file as done
+        for filename in new_filenames:
+            if filename in file_hashes:
+                manifest[filename] = file_hashes[filename]
+
+        self.index.storage_context.persist(persist_dir=PERSIST_DIR)
+        self._save_manifest(manifest)
+        print(f"Indexed and persisted {len(new_filenames)} new file(s).")
+
+        return report
+
+    @staticmethod
+    def _load_manifest() -> dict:
+        if os.path.exists(INDEXED_MANIFEST_PATH):
+            with open(INDEXED_MANIFEST_PATH, "r") as f:
+                return json.load(f)
+        return {}
+
+    @staticmethod
+    def _save_manifest(manifest: dict):
+        os.makedirs(PERSIST_DIR, exist_ok=True)
+        with open(INDEXED_MANIFEST_PATH, "w") as f:
+            json.dump(manifest, f)
+
+    def is_already_indexed(self, file_hash: str) -> bool:
+        manifest = self._load_manifest()
+        return file_hash in manifest.values()
 
     async def on_shutdown(self):
         pass

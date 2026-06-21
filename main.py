@@ -16,6 +16,8 @@ from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
 from schemas import FilterForm, OpenAIChatCompletionForm
 from urllib.parse import urlparse
+import uuid as uuid_lib
+
 
 import shutil
 import aiohttp
@@ -29,6 +31,7 @@ import sys
 import subprocess
 
 
+
 from config import API_KEY, PIPELINES_DIR, LOG_LEVELS
 
 if not os.path.exists(PIPELINES_DIR):
@@ -38,6 +41,7 @@ if not os.path.exists(PIPELINES_DIR):
 PIPELINES = {}
 PIPELINE_MODULES = {}
 PIPELINE_NAMES = {}
+SESSION_COOKIE_NAME = "session_id"
 
 # Add GLOBAL_LOG_LEVEL for Pipeplines
 log_level = os.getenv("GLOBAL_LOG_LEVEL", "INFO").upper()
@@ -800,3 +804,154 @@ async def generate_openai_chat_completion(form_data: OpenAIChatCompletionForm):
                 }
 
     return await run_in_threadpool(job)
+
+@app.post("/v1/{pipeline_id}/files/upload")
+@app.post("/{pipeline_id}/files/upload")
+async def upload_data_files(
+    pipeline_id: str,
+    files: List[UploadFile] = File(...),
+    user: str = Depends(get_current_user),
+):
+    """
+    Saves one or more PDF files into ./data, then triggers index_file
+    to scan ./data and index whatever's new (by content hash).
+    """
+    if user != API_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid API key",
+        )
+
+    if pipeline_id not in PIPELINE_MODULES:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Pipeline {pipeline_id} not found",
+        )
+
+    pipeline = PIPELINE_MODULES[pipeline_id]
+    if not hasattr(pipeline, "index_file"):
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Pipeline {pipeline_id} does not support file indexing.",
+        )
+
+    data_dir = "./data"
+    os.makedirs(data_dir, exist_ok=True)
+
+    saved = []
+
+    for file in files:
+        file_ext = os.path.splitext(file.filename)[1].lower()
+        if file_ext != ".pdf":
+            saved.append({
+                "filename": file.filename,
+                "status": False,
+                "detail": "Only PDF files are allowed.",
+            })
+            continue
+
+        safe_filename = os.path.basename(file.filename)
+        if not safe_filename:
+            saved.append({
+                "filename": file.filename,
+                "status": False,
+                "detail": "Invalid filename.",
+            })
+            continue
+
+        file_path = os.path.join(data_dir, safe_filename)
+
+        if os.path.exists(file_path):
+            saved.append({
+                "filename": safe_filename,
+                "status": False,
+                "detail": "Skipped — a file with this name already exists.",
+            })
+            continue
+
+        try:
+            contents = await file.read()
+            with open(file_path, "wb") as buffer:
+                buffer.write(contents)
+            saved.append({
+                "filename": safe_filename,
+                "status": True,
+                "detail": "Saved, pending indexing.",
+            })
+        except Exception as e:
+            saved.append({
+                "filename": safe_filename,
+                "status": False,
+                "detail": str(e),
+            })
+
+    indexed_report = await pipeline.index_file()
+
+    return {
+        "saved": saved,
+        "indexed": indexed_report,
+    }
+
+class RemoveFileForm(BaseModel):
+    filename: str
+
+@app.delete("/v1/{pipeline_id}/files/remove")
+@app.delete("/{pipeline_id}/files/remove")
+async def remove_data_file(
+    pipeline_id: str,
+    form_data: RemoveFileForm,
+    request: Request,
+    user: str = Depends(get_current_user),
+):
+    """
+    Removes a file from disk and from the pipeline's index/manifest,
+    so it can be re-uploaded later if needed.
+    """
+    if user != API_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid API key",
+        )
+
+    if pipeline_id not in PIPELINE_MODULES:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Pipeline {pipeline_id} not found",
+        )
+
+    pipeline = PIPELINE_MODULES[pipeline_id]
+    if not hasattr(pipeline, "remove_file"):
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Pipeline {pipeline_id} does not support file removal.",
+        )
+
+    session_id = request.cookies.get(SESSION_COOKIE_NAME)
+    if not session_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No session found.",
+        )
+
+    safe_filename = os.path.basename(form_data.filename)
+    file_path = os.path.join("./data", session_id, safe_filename)
+
+    removed_chunks = pipeline.remove_file(safe_filename)
+
+    file_removed_from_disk = False
+    if os.path.exists(file_path):
+        os.remove(file_path)
+        file_removed_from_disk = True
+
+    if removed_chunks == 0 and not file_removed_from_disk:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"File {safe_filename} not found in index or on disk.",
+        )
+
+    return {
+        "status": True,
+        "filename": safe_filename,
+        "chunks_removed": removed_chunks,
+        "removed_from_disk": file_removed_from_disk,
+    }
