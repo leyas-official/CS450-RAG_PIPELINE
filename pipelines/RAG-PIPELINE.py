@@ -267,24 +267,11 @@ class Pipeline:
             target_article = ", ".join(f"مادة {a}" for a in queried_articles)
             article_instruction = ARTICLE_INSTRUCTION_TEMPLATE.format(target_article=target_article)
 
-            vector_retriever = self.index.as_retriever(
-                similarity_top_k=20,
-                filters=MetadataFilters(
-                    filters=[MetadataFilter(key="article_numbers", value=a) for a in queried_articles],
-                ),
-            )
-
             # Filter BM25 nodes to only chunks containing the queried articles
             filtered_nodes = [
                 node for node in self.index.docstore.docs.values()
                 if any(a in node.metadata.get("article_numbers", []) for a in queried_articles)
             ]
-
-            if not filtered_nodes:
-                print("[WARNING] No chunks matched article filter, falling back to full docstore")
-                filtered_nodes = list(self.index.docstore.docs.values())
-
-            top_k = 25
 
         elif queried_actors:
             print("Queried actors FOUND")
@@ -297,31 +284,26 @@ class Pipeline:
                 if actor_matches(node.metadata.get("actors", []), queried_actors)
             ]
 
-            if not filtered_nodes:
-                print("[WARNING] No chunks matched actor filter, falling back to full docstore")
-                filtered_nodes = list(self.index.docstore.docs.values())
-                top_k = 25  # fallback to reasonable default since we're now searching everything
-            else:
-                top_k = len(filtered_nodes)
-
-            vector_retriever = self.index.as_retriever(
-                similarity_top_k=top_k,
-                filters=MetadataFilters(
-                    filters=[MetadataFilter(key="actors", value=a) for a in queried_actors],
-                    condition="or",
-                ),
-            )
-
         else:
             print("else statement")
-            top_k = 25
 
             article_instruction = NO_ARTICLE_INSTRUCTION
+
+            filtered_nodes = list(self.index.docstore.docs.values())
+            top_k = min(25, len(filtered_nodes))
             vector_retriever = self.index.as_retriever(similarity_top_k=top_k)
 
-            # No filter — search everything
+        if not filtered_nodes:
+            print("fallback")
             filtered_nodes = list(self.index.docstore.docs.values())
 
+        top_k = min(25, len(filtered_nodes))
+
+        filtered_index = VectorStoreIndex(filtered_nodes)
+
+        vector_retriever = filtered_index.as_retriever(
+            similarity_top_k=top_k
+        )
 
         bm25_retriever = BM25Retriever.from_defaults(
             nodes=filtered_nodes,
