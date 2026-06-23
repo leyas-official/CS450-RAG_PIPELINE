@@ -13,12 +13,12 @@ import os
 import hashlib
 from typing import List, Union, Generator, Iterator
 from dotenv import load_dotenv
+from llama_index.core import VectorStoreIndex
+from llama_index.core import Document
+import chromadb
 from llama_index.core.vector_stores import MetadataFilters, MetadataFilter
-from llama_index.core import Document, PromptTemplate, VectorStoreIndex
-from llama_index.core import Document, StorageContext, load_index_from_storage, Settings
-from llama_index.vector_stores.faiss import FaissVectorStore
+from llama_index.vector_stores.chroma import ChromaVectorStore
 from pydantic import BaseModel
-import faiss
 import json
 
 from pipeline_core.arabic_processing import ArabicArticleExtractor, ChunkArticleParser, TextAnalyzer, ActorExtractor
@@ -26,8 +26,6 @@ from pipeline_utils import load_documents_with_tika, split_by_articles, fixed_wi
 from pipelines.pipeline_core import Chunk
 from pipelines.pipeline_utils.utils import boost_nodes_with_actors, actor_matches
 
-from llama_index.embeddings.ollama import OllamaEmbedding
-from llama_index.llms.ollama import Ollama
 from llama_index.core import Settings
 from llama_index.core.postprocessor import SentenceTransformerRerank
 
@@ -67,9 +65,7 @@ class Pipeline:
     async def on_startup(self):
         from llama_index.embeddings.ollama import OllamaEmbedding
         from llama_index.llms.ollama import Ollama
-        from llama_index.core import Settings, VectorStoreIndex, StorageContext, load_index_from_storage
-        from llama_index.core.postprocessor import SentenceTransformerRerank
-        from llama_index.vector_stores.faiss import FaissVectorStore
+        from llama_index.core import Settings, VectorStoreIndex, StorageContext
 
         Settings.embed_model = OllamaEmbedding(
             model_name=self.valves.LLAMAINDEX_EMBEDDING_MODEL_NAME,
@@ -87,49 +83,19 @@ class Pipeline:
             device="cpu",
         )
 
-        # Load the persisted index from disk if it exists, so a server
-        # restart doesn't lose everything that's already been indexed.
-        if os.path.exists(PERSIST_DIR) and os.listdir(PERSIST_DIR):
-            print(f"Loading persisted index from {PERSIST_DIR}")
-            vector_store = FaissVectorStore.from_persist_dir(PERSIST_DIR)
-            storage_context = StorageContext.from_defaults(
-                vector_store=vector_store, persist_dir=PERSIST_DIR
-            )
-            self.index = load_index_from_storage(storage_context)
-            print("Loaded persisted index.")
-        else:
-            print("No persisted index found — starting with an empty index.")
-            faiss_index = faiss.IndexFlatL2(4096)
-            vector_store = FaissVectorStore(faiss_index=faiss_index)
-            storage_context = StorageContext.from_defaults(vector_store=vector_store)
-            self.index = VectorStoreIndex(nodes=[], storage_context=storage_context)
+        Settings.chunk_size = 4096
+
+        chroma_client = chromadb.PersistentClient(path=PERSIST_DIR)
+        chroma_collection = chroma_client.get_or_create_collection("RAG_PIPELINE")
+        vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
+        storage_context = StorageContext.from_defaults(vector_store=vector_store)
+        self.index = VectorStoreIndex.from_vector_store(vector_store, storage_context=storage_context)
 
     async def index_file(self):
-        """
-        Reads the entire ./data directory via Tika, but only chunks,
-        embeds, and inserts documents whose content hash isn't already
-        in the manifest. Already-indexed files are skipped after Tika
-        extraction (Tika doesn't support skipping individual files).
-        """
         data_dir = "./data"
-        manifest = self._load_manifest()  # filename -> hash
+        manifest = self._load_manifest()
         indexed_hashes = set(manifest.values())
 
-        # Load existing persisted index, or build a fresh empty one
-        if os.path.exists(PERSIST_DIR) and os.listdir(PERSIST_DIR):
-            vector_store = FaissVectorStore.from_persist_dir(PERSIST_DIR)
-            storage_context = StorageContext.from_defaults(
-                vector_store=vector_store, persist_dir=PERSIST_DIR
-            )
-            self.index = load_index_from_storage(storage_context)
-        elif getattr(self, "index", None) is None:
-            faiss_index = faiss.IndexFlatL2(4096)
-            vector_store = FaissVectorStore(faiss_index=faiss_index)
-            storage_context = StorageContext.from_defaults(vector_store=vector_store)
-            self.index = VectorStoreIndex(nodes=[], storage_context=storage_context)
-
-        # Pre-compute hashes for every file currently in ./data, so we know
-        # which ones are new BEFORE deciding whether to bother extracting them.
         file_hashes = {}
         for filename in os.listdir(data_dir):
             file_path = os.path.join(data_dir, filename)
@@ -149,7 +115,6 @@ class Pipeline:
             print("No new files found in ./data.")
             return report
 
-        # One Tika pass over the whole directory, as requested
         self.documents = load_documents_with_tika(data_dir)
         print(f"Loaded docs: {len(self.documents)}")
 
@@ -157,8 +122,6 @@ class Pipeline:
 
         for doc in self.documents:
             filename = doc.metadata.get("file_name")
-
-            # Skip documents whose file isn't new — already indexed
             if filename not in new_filenames:
                 continue
 
@@ -205,32 +168,58 @@ class Pipeline:
             print("No usable chunks among new files.")
             return report
 
-        # One batched actor-extraction call across ALL new files' chunks
         extract_actors_from_chunks(chunks, Settings.llm)
 
         for chunk in chunks:
             new_document = Document(
                 text=chunk.text,
+                doc_id=chunk.chunk_id,  # needed for deletion later
                 metadata={
                     "chunk_id": chunk.chunk_id,
-                    "article_numbers": chunk.article_numbers,
+                    "article_numbers": json.dumps(chunk.article_numbers),
                     "effective_mode": chunk.effective_mode,
                     "file_name": chunk.file_name,
-                    "actors": chunk.actors,
+                    "actors": json.dumps(chunk.actors),
                 },
             )
             self.index.insert(new_document)
 
-        # Mark every newly-indexed file as done
         for filename in new_filenames:
             if filename in file_hashes:
                 manifest[filename] = file_hashes[filename]
 
-        self.index.storage_context.persist(persist_dir=PERSIST_DIR)
         self._save_manifest(manifest)
-        print(f"Indexed and persisted {len(new_filenames)} new file(s).")
+        print(f"Indexed {len(new_filenames)} new file(s).")
 
         return report
+
+    def remove_file(self, filename: str) -> int:
+        if self.index is None:
+            return 0
+
+        vector_store = self.index.vector_store
+
+        nodes = vector_store.get_nodes(
+            node_ids=None,
+            filters=MetadataFilters(
+                filters=[MetadataFilter(key="file_name", value=filename)]
+            ),
+        )
+
+        node_ids = [node.node_id for node in nodes]
+        removed_count = len(node_ids)
+
+        print(f"DEBUG: found {removed_count} chunks for {filename}")
+
+        if removed_count > 0:
+            vector_store.delete_nodes(node_ids=node_ids)
+
+            manifest = self._load_manifest()
+            if filename in manifest:
+                del manifest[filename]
+                self._save_manifest(manifest)
+
+        return removed_count
 
     @staticmethod
     def _load_manifest() -> dict:
@@ -262,45 +251,45 @@ class Pipeline:
         queried_articles = ArabicArticleExtractor.extract(user_message)
         queried_actors = ActorExtractor.extract(user_message, llm=Settings.llm)
 
+        all_nodes = self.index.vector_store.get_nodes(node_ids=None, filters=None)
+        if not all_nodes:
+            return "لا توجد ملفات مفهرسة حاليًا. يرجى رفع ملف واحد على الأقل قبل البدء بطرح الأسئلة."
+
+        self.index.docstore.add_documents(all_nodes)
+
         if queried_articles:
-            print("Queried articles FOUND")
+            print("Queried articles route.")
             target_article = ", ".join(f"مادة {a}" for a in queried_articles)
             article_instruction = ARTICLE_INSTRUCTION_TEMPLATE.format(target_article=target_article)
 
-            # Filter BM25 nodes to only chunks containing the queried articles
             filtered_nodes = [
                 node for node in self.index.docstore.docs.values()
-                if any(a in node.metadata.get("article_numbers", []) for a in queried_articles)
+                if any(a in json.loads(node.metadata.get("article_numbers", "[]")) for a in queried_articles)
             ]
 
+            print(filtered_nodes)
+
         elif queried_actors:
-            print("Queried actors FOUND")
+            print("Queried actors route.")
             article_instruction = ACTOR_INSTRUCTION_TEMPLATE.format(
                 actors=", ".join(queried_actors)
             )
 
             filtered_nodes = [
                 node for node in self.index.docstore.docs.values()
-                if actor_matches(node.metadata.get("actors", []), queried_actors)
+                if actor_matches(json.loads(node.metadata.get("actors", [])), queried_actors)
             ]
 
         else:
-            print("else statement")
-
+            print("else statement route.")
             article_instruction = NO_ARTICLE_INSTRUCTION
-
             filtered_nodes = list(self.index.docstore.docs.values())
-            top_k = min(25, len(filtered_nodes))
-            vector_retriever = self.index.as_retriever(similarity_top_k=top_k)
 
         if not filtered_nodes:
-            print("fallback")
             filtered_nodes = list(self.index.docstore.docs.values())
 
         top_k = min(25, len(filtered_nodes))
-
         filtered_index = VectorStoreIndex(filtered_nodes)
-
         vector_retriever = filtered_index.as_retriever(
             similarity_top_k=top_k
         )
@@ -327,18 +316,24 @@ class Pipeline:
         else:
             reranked_nodes = boosted_nodes
 
-        context = "\n\n".join([
-            f"[المصدر: {node.metadata.get('file_name', 'غير معروف')}]\n{node.text}"
-            for node in reranked_nodes
-        ])
+        context_parts = []
+        for node in reranked_nodes:
+            file_name = node.metadata.get('file_name', 'غير معروف')
+            article_numbers = json.loads(node.metadata.get('article_numbers', '[]'))
+            actors = json.loads(node.metadata.get('actors', '[]'))
+            effective_mode = node.metadata.get('effective_mode', '')
 
-        print("\n===== RETRIEVED CHUNKS =====")
-        for i, node in enumerate(reranked_nodes):
-            print(f"\n--- CHUNK {i + 1} ---")
-            print("METADATA:", node.metadata)
-            print("TEXT:", node.text)
-            print("SCORE:", node.score)
-        print("===========================\n")
+            header = f"[المصدر: {file_name}]"
+            if article_numbers:
+                header += f" [مادة: {', '.join(str(a) for a in article_numbers)}]"
+            if actors:
+                header += f" [الفاعل المحتمل: {', '.join(actors)}]"
+            if effective_mode:
+                header += f" [الوضع: {effective_mode}]"
+
+            context_parts.append(f"{header}\n{node.text}")
+
+        context = "\n\n".join(context_parts)
 
         formatted_prompt = prompt.format(
             article_instruction=article_instruction,

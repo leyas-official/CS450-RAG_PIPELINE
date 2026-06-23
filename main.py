@@ -903,55 +903,41 @@ async def remove_data_file(
     request: Request,
     user: str = Depends(get_current_user),
 ):
-    """
-    Removes a file from disk and from the pipeline's index/manifest,
-    so it can be re-uploaded later if needed.
-    """
-    if user != API_KEY:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid API key",
-        )
+    try:
+        if user != API_KEY:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key")
 
-    if pipeline_id not in PIPELINE_MODULES:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Pipeline {pipeline_id} not found",
-        )
+        if pipeline_id not in PIPELINE_MODULES:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Pipeline {pipeline_id} not found")
 
-    pipeline = PIPELINE_MODULES[pipeline_id]
-    if not hasattr(pipeline, "remove_file"):
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Pipeline {pipeline_id} does not support file removal.",
-        )
+        pipeline = PIPELINE_MODULES[pipeline_id]
+        has_attr = hasattr(pipeline, "remove_file")
+        if not has_attr:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                                detail=f"Pipeline {pipeline_id} does not support file removal.")
 
-    session_id = request.cookies.get(SESSION_COOKIE_NAME)
-    if not session_id:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No session found.",
-        )
+        safe_filename = os.path.basename(form_data.filename)
+        file_path = os.path.join("./data", safe_filename)
 
-    safe_filename = os.path.basename(form_data.filename)
-    file_path = os.path.join("./data", session_id, safe_filename)
+        removed_chunks = pipeline.remove_file(safe_filename)
 
-    removed_chunks = pipeline.remove_file(safe_filename)
+        file_removed_from_disk = False
+        if os.path.exists(file_path):
+            os.remove(file_path)
+            file_removed_from_disk = True
 
-    file_removed_from_disk = False
-    if os.path.exists(file_path):
-        os.remove(file_path)
-        file_removed_from_disk = True
+        if removed_chunks == 0 and not file_removed_from_disk:
+            raise HTTPException(status_code=404, detail=f"File {safe_filename} not found in index or on disk.")
 
-    if removed_chunks == 0 and not file_removed_from_disk:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"File {safe_filename} not found in index or on disk.",
-        )
-
-    return {
-        "status": True,
-        "filename": safe_filename,
-        "chunks_removed": removed_chunks,
-        "removed_from_disk": file_removed_from_disk,
-    }
+        return {
+            "status": True,
+            "filename": safe_filename,
+            "chunks_removed": removed_chunks,
+            "removed_from_disk": file_removed_from_disk,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")

@@ -1,3 +1,4 @@
+python-dotenv
 # --- Core Web & API ---
 # Relaxed slightly to allow ChromaDB/SQLModel to resolve
 fastapi>=0.111.0
