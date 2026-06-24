@@ -248,8 +248,7 @@ class Pipeline:
         from llama_index.core.retrievers import QueryFusionRetriever
         from llama_index.retrievers.bm25 import BM25Retriever
 
-        queried_articles = ArabicArticleExtractor.extract(user_message)
-        queried_actors = ActorExtractor.extract(user_message, llm=Settings.llm)
+
 
         all_nodes = self.index.vector_store.get_nodes(node_ids=None, filters=None)
         if not all_nodes:
@@ -257,17 +256,29 @@ class Pipeline:
 
         self.index.docstore.add_documents(all_nodes)
 
+        selected_files = body.get("selected_files") or []
+        if selected_files:
+            scoped_nodes = [
+                node for node in self.index.docstore.docs.values()
+                if node.metadata.get("file_name") in selected_files
+            ]
+            if not scoped_nodes:
+                return "الملفات المحددة غير مفهرسة أو لا تحتوي على بيانات قابلة للبحث."
+        else:
+            scoped_nodes = list(self.index.docstore.docs.values())
+
+        queried_articles = ArabicArticleExtractor.extract(user_message)
+        queried_actors = ActorExtractor.extract(user_message, llm=Settings.llm)
+
         if queried_articles:
             print("Queried articles route.")
             target_article = ", ".join(f"مادة {a}" for a in queried_articles)
             article_instruction = ARTICLE_INSTRUCTION_TEMPLATE.format(target_article=target_article)
 
             filtered_nodes = [
-                node for node in self.index.docstore.docs.values()
+                node for node in scoped_nodes
                 if any(a in json.loads(node.metadata.get("article_numbers", "[]")) for a in queried_articles)
             ]
-
-            print(filtered_nodes)
 
         elif queried_actors:
             print("Queried actors route.")
@@ -276,17 +287,14 @@ class Pipeline:
             )
 
             filtered_nodes = [
-                node for node in self.index.docstore.docs.values()
+                node for node in scoped_nodes
                 if actor_matches(json.loads(node.metadata.get("actors", [])), queried_actors)
             ]
 
         else:
             print("else statement route.")
             article_instruction = NO_ARTICLE_INSTRUCTION
-            filtered_nodes = list(self.index.docstore.docs.values())
-
-        if not filtered_nodes:
-            filtered_nodes = list(self.index.docstore.docs.values())
+            filtered_nodes = scoped_nodes
 
         top_k = min(25, len(filtered_nodes))
         filtered_index = VectorStoreIndex(filtered_nodes)
@@ -317,7 +325,8 @@ class Pipeline:
             reranked_nodes = boosted_nodes
 
         context_parts = []
-        for node in reranked_nodes:
+
+        for i, node in enumerate(reranked_nodes, start=1):
             file_name = node.metadata.get('file_name', 'غير معروف')
             article_numbers = json.loads(node.metadata.get('article_numbers', '[]'))
             actors = json.loads(node.metadata.get('actors', '[]'))
@@ -331,7 +340,14 @@ class Pipeline:
             if effective_mode:
                 header += f" [الوضع: {effective_mode}]"
 
-            context_parts.append(f"{header}\n{node.text}")
+            chunk = f"{header}\n{node.text}"
+
+            print(f"\n{'=' * 80}")
+            print(f"CHUNK {i}")
+            print(f"{'=' * 80}")
+            print(chunk)
+
+            context_parts.append(chunk)
 
         context = "\n\n".join(context_parts)
 

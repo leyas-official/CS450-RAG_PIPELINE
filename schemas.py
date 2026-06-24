@@ -12,6 +12,7 @@ class OpenAIChatCompletionForm(BaseModel):
     stream: bool = True
     model: str
     messages: List[OpenAIChatMessage]
+    selected_files: List[str]
 
     model_config = ConfigDict(extra="allow")
 
