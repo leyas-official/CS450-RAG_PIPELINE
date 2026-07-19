@@ -11,7 +11,7 @@ requirements: llama-index, llama-index-llms-ollama, llama-index-embeddings-ollam
 
 import os
 import hashlib
-from typing import List, Union, Generator, Iterator
+from typing import List, Union, Generator, Iterator, Tuple
 from dotenv import load_dotenv
 from llama_index.core import VectorStoreIndex
 from llama_index.core import Document
@@ -22,9 +22,10 @@ from pydantic import BaseModel
 import json
 
 from pipeline_core.arabic_processing import ArabicArticleExtractor, ChunkArticleParser, TextAnalyzer, ActorExtractor
-from pipeline_utils import load_documents_with_tika, split_by_articles, fixed_width_chunking, boost_nodes_with_articles
+from pipeline_utils import load_documents_with_tika, split_by_articles, fixed_width_chunking
 from pipelines.pipeline_core import Chunk
-from pipelines.pipeline_utils.utils import boost_nodes_with_actors, actor_matches
+# from pipelines.pipeline_utils.utils import boost_nodes_with_actors, boost_nodes_with_articles
+from pipelines.pipeline_utils.actor_utils import actor_matches
 
 from llama_index.core import Settings
 from llama_index.core.postprocessor import SentenceTransformerRerank
@@ -36,11 +37,45 @@ from pipeline_core.prompts import (
     ACTOR_INSTRUCTION_TEMPLATE
 )
 
-from pipeline_utils.actor_utils import extract_actors_from_chunks
+from dotenv import find_dotenv
 
-load_dotenv()
-INDEXED_MANIFEST_PATH = os.getenv("INDEXED_MANIFEST_PATH")
-PERSIST_DIR = os.getenv("PERSIST_DIR")
+# find_dotenv() (usecwd=False, the default) walks UP from this file's own
+# directory looking for a .env — this is cwd-independent. It's needed here
+# because .env lives at the project root (one level above this file's own
+# folder), not next to RAG_PIPELINE.py itself.
+_ENV_PATH = find_dotenv(usecwd=False)
+load_dotenv(_ENV_PATH)
+
+# Resolve relative PERSIST_DIR / INDEXED_MANIFEST_PATH against the .env's
+# own directory (NOT this file's directory, and NOT the process's cwd).
+# Otherwise, a relative path in .env silently points at a different (often
+# empty) location depending on where the importing script is run from.
+_BASE_DIR = os.path.dirname(_ENV_PATH) if _ENV_PATH else os.path.dirname(os.path.abspath(__file__))
+
+
+def _resolve_path(value: str | None) -> str | None:
+    if not value:
+        return value
+    return value if os.path.isabs(value) else os.path.join(_BASE_DIR, value)
+
+
+INDEXED_MANIFEST_PATH = _resolve_path(os.getenv("INDEXED_MANIFEST_PATH"))
+PERSIST_DIR = _resolve_path(os.getenv("PERSIST_DIR"))
+
+print(f"[RAG_PIPELINE] .env found at: {_ENV_PATH}")
+print(f"[RAG_PIPELINE] PERSIST_DIR resolved to: {PERSIST_DIR}")
+print(f"[RAG_PIPELINE] INDEXED_MANIFEST_PATH resolved to: {INDEXED_MANIFEST_PATH}")
+
+
+class NoIndexedFilesError(ValueError):
+    """Raised when the vector store has no indexed nodes at all."""
+    pass
+
+
+class NoMatchingFilesError(ValueError):
+    """Raised when `selected_files` doesn't match any indexed node."""
+    pass
+
 
 class Pipeline:
 
@@ -75,6 +110,13 @@ class Pipeline:
             model=self.valves.LLAMAINDEX_MODEL_NAME,
             base_url=self.valves.LLAMAINDEX_OLLAMA_BASE_URL,
             request_timeout=300.0,
+        )
+
+        Settings.extraction_llm = Ollama(
+            model=self.valves.LLAMAINDEX_MODEL_NAME,
+            base_url=self.valves.LLAMAINDEX_OLLAMA_BASE_URL,
+            request_timeout=300.0,
+            temperature=0.0,
         )
 
         self.reranker = SentenceTransformerRerank(
@@ -126,7 +168,7 @@ class Pipeline:
                 continue
 
             split_articles = split_by_articles(doc.text)
-            split_articles = [a for a in split_articles if not TextAnalyzer.is_disciplinary(a)]
+            # split_articles = [a for a in split_articles if not TextAnalyzer.is_disciplinary(a)]
             chunks_list = fixed_width_chunking(split_articles, chunk_size=1, overlap=0)
 
             if not chunks_list:
@@ -168,7 +210,23 @@ class Pipeline:
             print("No usable chunks among new files.")
             return report
 
-        extract_actors_from_chunks(chunks, Settings.llm)
+        # Extract actors per chunk using ActorExtractor — the SAME extractor
+        # (same prompt, same LLM call shape) used for queries in retrieve().
+        # Previously this used a separate function, extract_actors_from_chunks,
+        # with its own independent prompt. Having chunk-side and query-side
+        # extraction go through two different prompts meant they could easily
+        # drift into different phrasing for the same real-world actor (e.g.
+        # one saying "اللجنة الشعبية العامة", the other "أمين اللجنة الشعبية
+        # العامة للضمان الاجتماعي" for what's conceptually the same entity),
+        # which is part of why actor matching was unreliable. Using one
+        # extractor for both sides doesn't fully solve that on its own (see
+        # actor_matches' embedding-based rewrite for the matching side), but
+        # it at least removes one avoidable source of inconsistency.
+        print(f"Extracting actors from {len(chunks)} chunks...")
+        for i, chunk in enumerate(chunks):
+            chunk.actors = ActorExtractor.extract(chunk.text, llm=Settings.extraction_llm)
+            print(f"  [{i + 1}/{len(chunks)}] {chunk.chunk_id} → actors: {chunk.actors}")
+        print("Actor extraction complete.")
 
         for chunk in chunks:
             new_document = Document(
@@ -241,34 +299,54 @@ class Pipeline:
     async def on_shutdown(self):
         pass
 
-    def pipe(
-        self, user_message: str, model_id: str, messages: List[dict], body: dict
-    ) -> Union[str, Generator, Iterator]:
-        from llama_index.core import Settings
+    def retrieve(self, user_message: str, selected_files: List[str] = None) -> Tuple[List, str]:
+        """
+        Isolated retrieval logic (previously inlined in `pipe()`).
+
+        Loads all indexed nodes into the docstore, applies file/article/actor
+        scoping, runs hybrid vector+BM25 fusion retrieval, boosts, and
+        reranks. Returns the ranked nodes plus the instruction string to use
+        in the final prompt.
+
+        This is split out from `pipe()` so it can be:
+          - reused by pipe() for the live app
+          - called directly by offline evaluation harnesses (e.g. RAGAS)
+            to test retrieval quality in isolation, without needing an LLM
+            call at the end.
+
+        Args:
+            user_message: the user's query.
+            selected_files: optional list of file names to scope retrieval to.
+
+        Returns:
+            (reranked_nodes, article_instruction)
+
+        Raises:
+            NoIndexedFilesError: if the vector store has no indexed nodes.
+            NoMatchingFilesError: if selected_files doesn't match any node.
+        """
         from llama_index.core.retrievers import QueryFusionRetriever
         from llama_index.retrievers.bm25 import BM25Retriever
 
-
-
         all_nodes = self.index.vector_store.get_nodes(node_ids=None, filters=None)
         if not all_nodes:
-            return "لا توجد ملفات مفهرسة حاليًا. يرجى رفع ملف واحد على الأقل قبل البدء بطرح الأسئلة."
+            raise NoIndexedFilesError("No files are currently indexed.")
 
         self.index.docstore.add_documents(all_nodes)
 
-        selected_files = body.get("selected_files") or []
+        selected_files = selected_files or []
         if selected_files:
             scoped_nodes = [
                 node for node in self.index.docstore.docs.values()
                 if node.metadata.get("file_name") in selected_files
             ]
             if not scoped_nodes:
-                return "الملفات المحددة غير مفهرسة أو لا تحتوي على بيانات قابلة للبحث."
+                raise NoMatchingFilesError("Selected files are not indexed or contain no searchable data.")
         else:
             scoped_nodes = list(self.index.docstore.docs.values())
 
         queried_articles = ArabicArticleExtractor.extract(user_message)
-        queried_actors = ActorExtractor.extract(user_message, llm=Settings.llm)
+        queried_actors = ActorExtractor.extract(user_message, llm=Settings.extraction_llm)
 
         if queried_articles:
             print("Queried articles route.")
@@ -279,6 +357,15 @@ class Pipeline:
                 node for node in scoped_nodes
                 if any(a in json.loads(node.metadata.get("article_numbers", "[]")) for a in queried_articles)
             ]
+
+            if not filtered_nodes:
+                # No chunk's parsed article_numbers matched the queried article(s)
+                # (could be a format mismatch, a typo, or an article not present
+                # in this document set). Fall back to the full scoped set rather
+                # than handing BM25/vector retrievers an empty node list.
+                print(f"[WARNING] No chunks matched article filter {queried_articles}, "
+                      f"falling back to full scoped set ({len(scoped_nodes)} nodes)")
+                filtered_nodes = scoped_nodes
 
         elif queried_actors:
             print("Queried actors route.")
@@ -291,10 +378,19 @@ class Pipeline:
                 if actor_matches(json.loads(node.metadata.get("actors", [])), queried_actors)
             ]
 
+            if not filtered_nodes:
+                print(f"[WARNING] No chunks matched actor filter {queried_actors}, "
+                      f"falling back to full scoped set ({len(scoped_nodes)} nodes)")
+                filtered_nodes = scoped_nodes
+
         else:
             print("else statement route.")
             article_instruction = NO_ARTICLE_INSTRUCTION
             filtered_nodes = scoped_nodes
+
+        if not filtered_nodes:
+            # Only reachable if scoped_nodes itself was empty going in.
+            raise NoMatchingFilesError("No indexed chunks available for this query scope.")
 
         top_k = min(25, len(filtered_nodes))
         filtered_index = VectorStoreIndex(filtered_nodes)
@@ -307,7 +403,7 @@ class Pipeline:
             similarity_top_k=top_k,
         )
 
-        retriever = QueryFusionRetriever(
+        fusion_retriever = QueryFusionRetriever(
             [vector_retriever, bm25_retriever],
             similarity_top_k=top_k,
             num_queries=4,
@@ -315,14 +411,35 @@ class Pipeline:
             use_async=False,
         )
 
-        nodes = retriever.retrieve(user_message)
-        boosted_nodes = boost_nodes_with_articles(nodes, queried_articles)
-        boosted_nodes += boost_nodes_with_actors(nodes, queried_actors)
+        nodes = fusion_retriever.retrieve(user_message)
 
-        if queried_articles:
-            reranked_nodes = self.reranker.postprocess_nodes(boosted_nodes, query_str=user_message)
-        else:
-            reranked_nodes = boosted_nodes
+        # nodes = boost_nodes_with_articles(nodes, queried_articles)
+        # nodes = boost_nodes_with_actors(nodes, queried_actors)
+        # boosted_nodes = sorted(nodes, key=lambda n: n.score or 0.0, reverse=True)
+        #
+        # if queried_articles:
+        #     reranked_nodes = self.reranker.postprocess_nodes(boosted_nodes, query_str=user_message)
+        # else:
+        #     reranked_nodes = boosted_nodes
+
+        reranked_nodes = self.reranker.postprocess_nodes(nodes, query_str=user_message)
+
+        return reranked_nodes, article_instruction
+
+    # model_id: str, messages: List[dict],
+    # just in case if I need these parameters
+
+    def pipe(
+        self, user_message: str, body: dict, model_id: str, messages: List[dict],
+    ) -> Union[str, Generator, Iterator]:
+        selected_files = body.get("selected_files") or []
+
+        try:
+            reranked_nodes, article_instruction = self.retrieve(user_message, selected_files=selected_files)
+        except NoIndexedFilesError:
+            return "لا توجد ملفات مفهرسة حاليًا. يرجى رفع ملف واحد على الأقل قبل البدء بطرح الأسئلة."
+        except NoMatchingFilesError:
+            return "الملفات المحددة غير مفهرسة أو لا تحتوي على بيانات قابلة للبحث."
 
         context_parts = []
 

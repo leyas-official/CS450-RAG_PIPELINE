@@ -3,6 +3,9 @@ import re
 from tika import parser
 from llama_index.core import Document
 
+# import json
+# from pipelines.pipeline_utils import actor_matches
+
 
 def load_documents_with_tika(directory: str):
     documents = []
@@ -141,29 +144,23 @@ def fixed_width_chunking(articles, chunk_size=3, overlap=1):
     return chunks
 
 
-def boost_nodes_with_articles(nodes, query_articles):
-    for node in nodes:
-        node.score = node.score or 0.0
-        if query_articles:
-            chunk_articles = node.metadata.get("Article", [])
-            if any(a in chunk_articles for a in query_articles):
-                node.score += 1.0
-
-    return nodes
-
-def boost_nodes_with_actors(nodes, query_actors):
-    for node in nodes:
-        node.score = node.score or 0.0
-        if query_actors:
-            chunk_actors = node.metadata.get("actors", [])
-            if any(a in chunk_actors for a in query_actors):
-                node.score += 1.0
-
-    return nodes
-
-def actor_matches(chunk_actors: list, query_actors: list) -> bool:
-    for qa in query_actors:
-        for ca in chunk_actors:
-            if qa in ca or ca in qa:
-                return True
-    return False
+# def boost_nodes_with_articles(nodes, query_articles):
+#     if not query_articles:
+#         return nodes
+#     for node in nodes:
+#         node.score = node.score or 0.0
+#         chunk_articles = json.loads(node.metadata.get("article_numbers", "[]"))
+#         if any(a in chunk_articles for a in query_articles):
+#             node.score += 1.0
+#     return nodes
+#
+#
+# def boost_nodes_with_actors(nodes, query_actors):
+#     if not query_actors:
+#         return nodes
+#     for node in nodes:
+#         node.score = node.score or 0.0
+#         chunk_actors = json.loads(node.metadata.get("actors", "[]"))  # parse the JSON properly
+#         if actor_matches(chunk_actors, query_actors):  # reuse the real matching logic, not raw `in`
+#             node.score += 1.0
+#     return nodes
