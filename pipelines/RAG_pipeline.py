@@ -26,6 +26,7 @@ from pipeline_utils import load_documents_with_tika, split_by_articles, fixed_wi
 from pipelines.pipeline_core import Chunk
 # from pipelines.pipeline_utils.utils import boost_nodes_with_actors, boost_nodes_with_articles
 from pipelines.pipeline_utils.actor_utils import actor_matches
+from llama_index.postprocessor.cohere_rerank import CohereRerank
 
 from llama_index.core import Settings
 from llama_index.core.postprocessor import SentenceTransformerRerank
@@ -83,6 +84,7 @@ class Pipeline:
         LLAMAINDEX_OLLAMA_BASE_URL: str
         LLAMAINDEX_MODEL_NAME: str
         LLAMAINDEX_EMBEDDING_MODEL_NAME: str
+        COHERE_API_KEY: str
 
     def __init__(self):
         self.documents = None
@@ -94,6 +96,7 @@ class Pipeline:
                 "LLAMAINDEX_OLLAMA_BASE_URL": os.getenv("LLAMAINDEX_OLLAMA_BASE_URL", "http://localhost:11434"),
                 "LLAMAINDEX_MODEL_NAME": os.getenv("LLAMAINDEX_MODEL_NAME", "llama3"),
                 "LLAMAINDEX_EMBEDDING_MODEL_NAME": os.getenv("LLAMAINDEX_EMBEDDING_MODEL_NAME", "nomic-embed-text"),
+                "COHERE_API_KEY": os.getenv("COHERE_API_KEY", ""),
             }
         )
 
@@ -119,10 +122,16 @@ class Pipeline:
             temperature=0.0,
         )
 
-        self.reranker = SentenceTransformerRerank(
-            model="BAAI/bge-reranker-v2-gemma",
-            top_n=6,
-            device="cpu",
+        # self.reranker = SentenceTransformerRerank(
+        #     model="BAAI/bge-reranker-v2-gemma",
+        #     top_n=20,
+        #     device="cpu",
+        # )
+
+        self.reranker = CohereRerank(
+            api_key=self.valves.COHERE_API_KEY,
+            model="rerank-v3.5",  # pass this explicitly — some SDK versions still default to an older model
+            top_n=20,
         )
 
         Settings.chunk_size = 4096
@@ -346,7 +355,7 @@ class Pipeline:
             scoped_nodes = list(self.index.docstore.docs.values())
 
         queried_articles = ArabicArticleExtractor.extract(user_message)
-        queried_actors = ActorExtractor.extract(user_message, llm=Settings.extraction_llm)
+        queried_actors = [] if queried_articles else ActorExtractor.extract(user_message, llm=Settings.extraction_llm)
 
         if queried_articles:
             print("Queried articles route.")
@@ -429,44 +438,25 @@ class Pipeline:
     # model_id: str, messages: List[dict],
     # just in case if I need these parameters
 
-    def pipe(
-        self, user_message: str, body: dict, model_id: str, messages: List[dict],
-    ) -> Union[str, Generator, Iterator]:
-        selected_files = body.get("selected_files") or []
+    def generate(self, user_message: str) -> Tuple[str, List[str]]:
+        """
+        Runs retrieval + generation (the full pipe() logic) and returns
+        both the generated answer and the retrieved context texts, so
+        evaluation harnesses can score faithfulness against exactly what
+        the model actually saw.
 
-        try:
-            reranked_nodes, article_instruction = self.retrieve(user_message, selected_files=selected_files)
-        except NoIndexedFilesError:
-            return "لا توجد ملفات مفهرسة حاليًا. يرجى رفع ملف واحد على الأقل قبل البدء بطرح الأسئلة."
-        except NoMatchingFilesError:
-            return "الملفات المحددة غير مفهرسة أو لا تحتوي على بيانات قابلة للبحث."
+        Returns:
+            (answer_text, retrieved_context_texts)
+        """
+        from llama_index.core import Settings
 
-        context_parts = []
+        reranked_nodes, article_instruction = self.retrieve(user_message)
+        contexts = [node.text for node in reranked_nodes]
 
-        for i, node in enumerate(reranked_nodes, start=1):
-            file_name = node.metadata.get('file_name', 'غير معروف')
-            article_numbers = json.loads(node.metadata.get('article_numbers', '[]'))
-            actors = json.loads(node.metadata.get('actors', '[]'))
-            effective_mode = node.metadata.get('effective_mode', '')
-
-            header = f"[المصدر: {file_name}]"
-            if article_numbers:
-                header += f" [مادة: {', '.join(str(a) for a in article_numbers)}]"
-            if actors:
-                header += f" [الفاعل المحتمل: {', '.join(actors)}]"
-            if effective_mode:
-                header += f" [الوضع: {effective_mode}]"
-
-            chunk = f"{header}\n{node.text}"
-
-            print(f"\n{'=' * 80}")
-            print(f"CHUNK {i}")
-            print(f"{'=' * 80}")
-            print(chunk)
-
-            context_parts.append(chunk)
-
-        context = "\n\n".join(context_parts)
+        context = "\n\n".join([
+            f"[المصدر: {node.metadata.get('file_name', 'غير معروف')}]\n{node.text}"
+            for node in reranked_nodes
+        ])
 
         formatted_prompt = prompt.format(
             article_instruction=article_instruction,
@@ -476,6 +466,12 @@ class Pipeline:
 
         try:
             response = Settings.llm.complete(formatted_prompt)
-            return response.text
+            return response.text, contexts
         except Exception as e:
-            return f"خطأ أثناء المعالجة: {e}"
+            return f"خطأ أثناء المعالجة: {e}", contexts
+
+    def pipe(
+            self, user_message: str, model_id: str, messages: List[dict], body: dict
+    ) -> Union[str, Generator, Iterator]:
+        answer_text, _ = self.generate(user_message)
+        return answer_text

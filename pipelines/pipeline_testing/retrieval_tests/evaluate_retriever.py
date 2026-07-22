@@ -18,7 +18,7 @@ After grading, see import_judge_scores.py to merge DeepSeek's scores
 back in and get the final route-by-route breakdown.
 
 Usage:
-    python evaluate_retriever.py --dataset functional_requirements_eval_set_merged.csv
+    python evaluate_retriever.py --dataset ../eval_test_set.csv
 """
 
 import argparse
@@ -29,9 +29,23 @@ from pathlib import Path
 
 import pandas as pd
 
-sys.path.append(str(Path(__file__).resolve().parent.parent))
+_here = Path(__file__).resolve()
+_rag_pipeline_dir = None
+for _parent in _here.parents:
+    if (_parent / "RAG_pipeline.py").is_file():
+        _rag_pipeline_dir = _parent
+        break
 
-from pipelines.RAG_PIPELINE import Pipeline
+if _rag_pipeline_dir is None:
+    raise RuntimeError(
+        "Could not find RAG_pipeline.py by walking up from this script's location — "
+        "check the folder structure hasn't moved."
+    )
+
+sys.path.insert(0, str(_rag_pipeline_dir))          # lets bare `pipeline_core`, `pipeline_utils` import
+sys.path.insert(0, str(_rag_pipeline_dir.parent))   # lets `pipelines.RAG_PIPELINE`, `pipelines.pipeline_core` import
+
+from pipelines.RAG_pipeline import Pipeline
 
 
 def load_eval_questions(path: str) -> list[dict]:
@@ -220,9 +234,9 @@ def main(dataset_path: str, batch_size: int, top_n_contexts: int, out_dir: str):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", default="functional_requirements_eval_set_merged.csv")
-    parser.add_argument("--batch-size", type=int, default=10, help="Questions per judge file")
-    parser.add_argument("--top-n-contexts", type=int, default=8, help="Max retrieved chunks shown to the judge per question")
+    parser.add_argument("--dataset", default="../eval_test_set.csv")
+    parser.add_argument("--batch-size", type=int, default=5, help="Questions per judge file")
+    parser.add_argument("--top-n-contexts", type=int, default=20, help="Max retrieved chunks shown to the judge per question")
     parser.add_argument("--out-dir", default="judge_export")
     args = parser.parse_args()
     main(args.dataset, args.batch_size, args.top_n_contexts, args.out_dir)

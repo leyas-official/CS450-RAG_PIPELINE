@@ -1,0 +1,49 @@
+[
+  {
+    "id": 11,
+    "precision_verdicts": [
+      1,
+      0,
+      0
+    ],
+    "context_recall": 0.6667,
+    "entity_recall": 1.0
+  },
+  {
+    "id": 12,
+    "precision_verdicts": [
+      1,
+      0
+    ],
+    "context_recall": 1.0,
+    "entity_recall": 0.8333
+  },
+  {
+    "id": 13,
+    "precision_verdicts": [
+      1,
+      0
+    ],
+    "context_recall": 1.0,
+    "entity_recall": 0.75
+  },
+  {
+    "id": 14,
+    "precision_verdicts": [
+      1,
+      0
+    ],
+    "context_recall": 1.0,
+    "entity_recall": 0.8571
+  },
+  {
+    "id": 15,
+    "precision_verdicts": [
+      1,
+      0,
+      0
+    ],
+    "context_recall": 1.0,
+    "entity_recall": 0.8571
+  }
+]

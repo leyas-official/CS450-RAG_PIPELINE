@@ -86,55 +86,168 @@ def main(score_paths: list[str], diagnostics_path: str, out_path: str):
 
     metric_cols = ["context_precision", "context_recall", "entity_recall"]
 
+    def pct(x):
+        """Format fraction as percentage with one decimal, or 'N/A'."""
+        return f"{x * 100:.1f}%" if pd.notna(x) else "N/A"
+
+    # Unicode isolates so terminals don't scramble Arabic with Latin text.
+    RLI = "\u2067"
+    PDI = "\u2069"
+
+    def rtl(text):
+        return f"{RLI}{text}{PDI}"
+
+    # ------------------------------------------------------------------
+    # OVERALL
+    # ------------------------------------------------------------------
+
     print("\n===== OVERALL =====")
-    print(merged[metric_cols].mean(numeric_only=True))
+
+    overall = merged[metric_cols].mean(numeric_only=True)
+
+    print(f"{'Metric':<22} {'Value':>10}")
+    print("-" * 34)
+    print(f"{'Context Precision':<22} {pct(overall['context_precision']):>10}")
+    print(f"{'Context Recall':<22} {pct(overall['context_recall']):>10}")
+    print(f"{'Entity Recall':<22} {pct(overall['entity_recall']):>10}")
+
+    # ------------------------------------------------------------------
+    # BY ROUTE
+    # ------------------------------------------------------------------
 
     print("\n===== BY ROUTE (article / actor / else) =====")
-    print(merged.groupby("route")[metric_cols].mean(numeric_only=True))
+
+    route_means = merged.groupby("route")[metric_cols].mean(numeric_only=True)
+
+    print(
+        f"{'Route':<12}"
+        f"{'Context_Precision':>16}"
+        f"{'Context_Recall':>16}"
+        f"{'Entity_Recall':>16}"
+    )
+    print("-" * 60)
+
+    for route, row in route_means.iterrows():
+        print(
+            f"{route:<12}"
+            f"{pct(row['context_precision']):>12}"
+            f"{pct(row['context_recall']):>12}"
+            f"{pct(row['entity_recall']):>12}"
+        )
+
+    # ------------------------------------------------------------------
+    # BY REQUIREMENT CATEGORY
+    # ------------------------------------------------------------------
 
     print("\n===== BY REQUIREMENT CATEGORY (top 10 by count) =====")
-    top_cats = merged["requirement_category"].value_counts().head(10).index
-    print(merged[merged["requirement_category"].isin(top_cats)]
-          .groupby("requirement_category")[metric_cols].mean(numeric_only=True))
 
-    # --- Hit@k breakdown ---
-    # retriever_diagnostics.csv (from the current evaluate_retriever.py) has
-    # article_hit@k / actor_hit@k columns per cutoff instead of the old
-    # single article_ref_hit / actor_ref_hit columns. This shows, for each
-    # cutoff, what fraction of applicable questions found the right article
-    # (on the "article" route) or actor (on the "actor" route) within the
-    # top k retrieved chunks. .dropna() excludes questions with no
-    # ground-truth reference to check, so they don't skew the average.
-    article_hit_cols = [f"article_hit@{k}" for k in HIT_AT_K_CUTOFFS if f"article_hit@{k}" in merged.columns]
-    actor_hit_cols = [f"actor_hit@{k}" for k in HIT_AT_K_CUTOFFS if f"actor_hit@{k}" in merged.columns]
+    top_cats = merged["requirement_category"].value_counts().head(10)
+
+    cat_groups = (
+        merged[merged["requirement_category"].isin(top_cats.index)]
+        .groupby("requirement_category")
+    )
+
+    cat_means = cat_groups[["context_recall", "entity_recall"]].mean()
+    cat_counts = cat_groups.size()
+
+    CAT_WIDTH = 45
+
+    print(
+        f"{'Requirement Category':<{CAT_WIDTH}}"
+        f"{'Count':>8}"
+        f"{'Context_Recall':>16}"
+        f"{'Entity_Recall':>16}"
+    )
+
+    print("-" * (CAT_WIDTH + 40))
+
+    for cat in top_cats.index:
+        print(
+            f"{rtl(cat):<{CAT_WIDTH}}"
+            f"{cat_counts[cat]:>6}"
+            f"{pct(cat_means.loc[cat, 'context_recall']):>14}"
+            f"{pct(cat_means.loc[cat, 'entity_recall']):>14}"
+        )
+
+    # ------------------------------------------------------------------
+    # Hit@k breakdown
+    # ------------------------------------------------------------------
+
+    article_hit_cols = [
+        f"article_hit@{k}"
+        for k in HIT_AT_K_CUTOFFS
+        if f"article_hit@{k}" in merged.columns
+    ]
+
+    actor_hit_cols = [
+        f"actor_hit@{k}"
+        for k in HIT_AT_K_CUTOFFS
+        if f"actor_hit@{k}" in merged.columns
+    ]
 
     if article_hit_cols:
-        print("\n===== article_hit@k rate (article-route questions) =====")
+        print("\n===== ARTICLE HIT@K =====")
+
         article_route = merged[merged["route"] == "article"]
+
+        print(f"{'Metric':<18}{'Rate':>10}")
+        print("-" * 28)
+
         for col in article_hit_cols:
             rate = article_route[col].dropna()
-            print(f"  {col}: {rate.mean():.1%}" if len(rate) else f"  {col}: n/a (no applicable rows)")
+            value = pct(rate.mean()) if len(rate) else "N/A"
+            print(f"{col:<18}{value:>10}")
 
     if actor_hit_cols:
-        print("\n===== actor_hit@k rate (actor-route questions) =====")
+        print("\n===== ACTOR HIT@K =====")
+
         actor_route = merged[merged["route"] == "actor"]
+
+        print(f"{'Metric':<18}{'Rate':>10}")
+        print("-" * 28)
+
         for col in actor_hit_cols:
             rate = actor_route[col].dropna()
-            print(f"  {col}: {rate.mean():.1%}" if len(rate) else f"  {col}: n/a (no applicable rows)")
+            value = pct(rate.mean()) if len(rate) else "N/A"
+            print(f"{col:<18}{value:>10}")
 
     if not article_hit_cols and not actor_hit_cols:
-        # Backward-compat fallback, in case an older-format diagnostics CSV
-        # (with the original single-column article_ref_hit/actor_ref_hit) is
-        # passed in instead.
         if "article_ref_hit" in merged.columns and merged["article_ref_hit"].notna().any():
-            print("\narticle_ref_hit rate (article-route questions):",
-                  merged.loc[merged["route"] == "article", "article_ref_hit"].mean())
+            print(
+                "\narticle_ref_hit rate:",
+                pct(
+                    merged.loc[
+                        merged["route"] == "article",
+                        "article_ref_hit",
+                    ].mean()
+                ),
+            )
+
         if "actor_ref_hit" in merged.columns and merged["actor_ref_hit"].notna().any():
-            print("actor_ref_hit rate (actor-route questions):",
-                  merged.loc[merged["route"] == "actor", "actor_ref_hit"].mean())
+            print(
+                "actor_ref_hit rate:",
+                pct(
+                    merged.loc[
+                        merged["route"] == "actor",
+                        "actor_ref_hit",
+                    ].mean()
+                ),
+            )
+
+    # ------------------------------------------------------------------
+    # MERGED SCORE
+    # ------------------------------------------------------------------
+
+    merged["recall_score"] = (
+            0.5 * merged["context_recall"]
+            + 0.5 * merged["entity_recall"]
+    )
+
+    print("\n===== MERGED SCORE =====")
+    print(f"OVER_ALL_RECALL_SCORE: {pct(merged['recall_score'].mean())}")
 
     print(f"\nSaved merged results to {out_path}")
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

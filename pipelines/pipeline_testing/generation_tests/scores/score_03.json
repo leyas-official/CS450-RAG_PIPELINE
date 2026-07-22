@@ -1,0 +1,69 @@
+[
+  {
+    "id": 11,
+    "faithfulness_verdicts": [
+      1,
+      1,
+      1,
+      0
+    ],
+    "answer_relevancy": 0.95,
+    "answer_correctness": 1.0
+  },
+  {
+    "id": 12,
+    "faithfulness_verdicts": [
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1
+    ],
+    "answer_relevancy": 0.5,
+    "answer_correctness": 1.0
+  },
+  {
+    "id": 13,
+    "faithfulness_verdicts": [
+      1,
+      1,
+      1,
+      1
+    ],
+    "answer_relevancy": 1.0,
+    "answer_correctness": 1.0
+  },
+  {
+    "id": 14,
+    "faithfulness_verdicts": [
+      1,
+      1,
+      1,
+      0,
+      0,
+      1
+    ],
+    "answer_relevancy": 0.9,
+    "answer_correctness": 0.7
+  },
+  {
+    "id": 15,
+    "faithfulness_verdicts": [
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1
+    ],
+    "answer_relevancy": 1.0,
+    "answer_correctness": 1.0
+  }
+]

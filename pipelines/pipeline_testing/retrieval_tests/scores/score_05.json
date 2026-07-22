@@ -1,0 +1,120 @@
+[
+  {
+    "id": 21,
+    "precision_verdicts": [
+      0,
+      1,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "context_recall": 0.5,
+    "entity_recall": 0.75
+  },
+  {
+    "id": 22,
+    "precision_verdicts": [
+      1,
+      0,
+      1,
+      1,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "context_recall": 1.0,
+    "entity_recall": 1.0
+  },
+  {
+    "id": 23,
+    "precision_verdicts": [
+      1,
+      0,
+      0
+    ],
+    "context_recall": 1.0,
+    "entity_recall": 1.0
+  },
+  {
+    "id": 24,
+    "precision_verdicts": [
+      1,
+      0,
+      1,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "context_recall": 1.0,
+    "entity_recall": 1.0
+  },
+  {
+    "id": 25,
+    "precision_verdicts": [
+      0,
+      1,
+      0,
+      1,
+      0,
+      1,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "context_recall": 0.75,
+    "entity_recall": 1.0
+  }
+]
